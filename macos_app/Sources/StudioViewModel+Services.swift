@@ -562,6 +562,7 @@ extension StudioViewModel {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_500_000_000)
                 tick += 1
+                expireGPUUtilizationIfNeeded()
                 if isConnected {
                     // Byte counts come from status; sampling telemetry arrives separately with each job poll.
                     if !isGenerating || imagePEJobProgress?.stage == .downloading || imagePEStatus?.downloading == true || tick % 6 == 0 {
@@ -641,7 +642,8 @@ extension StudioViewModel {
         }
     }
 
-    func applyStatusResponse(_ decoded: ColabStatusResponse) {
+    func applyStatusResponse(_ decoded: ColabStatusResponse, from base: String) {
+        guard base == normalizedBaseURL else { return }
         if decoded.selected_model_id == selectedModelId {
             serverEditReferenceLimit = decoded.edit_reference_limit.flatMap { $0 > 0 ? $0 : nil }
         }
@@ -662,7 +664,7 @@ extension StudioViewModel {
         driveTotalGB = decoded.drive_total_gb ?? driveTotalGB
         driveUsedGB = decoded.drive_used_gb ?? driveUsedGB
         driveFreeGB = decoded.drive_free_gb ?? driveFreeGB
-        recordTelemetrySample()
+        recordTelemetrySample(gpuPercent: decoded.gpu_utilization_percent, sampledAt: decoded.gpu_utilization_sampled_at)
         if let remoteCustom = decoded.custom_models {
             mergeRemoteCustomModels(remoteCustom)
         }
@@ -1232,7 +1234,7 @@ extension StudioViewModel {
                         return
                     }
                 } else {
-                    applyStatusResponse(decoded)
+                    applyStatusResponse(decoded, from: base)
                     if let reg = decoded.registered_model {
                         let spec = OpenModelSpec.fromCustomDTO(reg)
                         if let idx = customModels.firstIndex(where: { $0.id == spec.id }) {
@@ -1330,7 +1332,7 @@ extension StudioViewModel {
             ])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
         } catch {}
     }
 
@@ -1362,7 +1364,7 @@ extension StudioViewModel {
             ])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             // 持续轮询直到启动完成并拿到 trycloudflare 公网画布地址
             for _ in 0..<180 {
@@ -1405,7 +1407,7 @@ extension StudioViewModel {
             req.timeoutInterval = 35
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
             statusMessage = comfyStatusMessage
         } catch {
             statusMessage = L(
@@ -1424,7 +1426,7 @@ extension StudioViewModel {
             req.timeoutInterval = 20
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
             if let am = decoded.action_message, !am.isEmpty {
                 statusMessage = am
             }
@@ -1445,7 +1447,7 @@ extension StudioViewModel {
             req.timeoutInterval = 90
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
             if let am = decoded.action_message, !am.isEmpty {
                 statusMessage = am
             }
@@ -1491,7 +1493,7 @@ extension StudioViewModel {
             ])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             while comfyDownloadingWeight {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1550,7 +1552,7 @@ extension StudioViewModel {
                 return
             }
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             for _ in 0..<600 {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -1633,7 +1635,7 @@ extension StudioViewModel {
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             remoteApiKeySynced = true
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
         } catch {}
     }
 
@@ -1649,7 +1651,7 @@ extension StudioViewModel {
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             remoteContextSynced = true
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
             if announce, let msg = decoded.task_message, !msg.isEmpty {
                 statusMessage = msg
             }

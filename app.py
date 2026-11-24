@@ -3364,7 +3364,33 @@ def _get_storage_metrics_dict(refresh_drive: bool = False) -> Dict[str, Any]:
     }
 
 
-def _sample_live_hardware_telemetry_once() -> Dict[str, Any]:
+def _read_gpu_utilization_percent() -> Optional[int]:
+    """Read the busy time of CUDA device 0 over the driver's latest sample window."""
+    try:
+        value = torch.cuda.utilization(0)
+        if type(value) is int and 0 <= value <= 100:
+            return value
+    except Exception:
+        # Some Colab images have the NVIDIA driver and CLI but lack the optional NVML Python binding.
+        pass
+
+    try:
+        cmd = ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"]
+        device_uuid = getattr(torch.cuda.get_device_properties(0), "uuid", None)
+        if device_uuid:
+            gpu_id = str(device_uuid)
+            if not gpu_id.startswith(("GPU-", "MIG-")):
+                gpu_id = f"GPU-{gpu_id}"
+            cmd.extend(["--id", gpu_id])
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=1.5)
+        # Without a UUID, accept only a single result to avoid reporting another card's activity.
+        value = int(result.stdout.strip())
+        return value if 0 <= value <= 100 else None
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+
+def _sample_live_hardware_telemetry_once(*, sample_utilization: bool = False) -> Dict[str, Any]:
     if not torch.cuda.is_available():
         gpu_name = "CPU Mode (未检测到 GPU)"
         cuda_avail = False
@@ -3387,10 +3413,17 @@ def _sample_live_hardware_telemetry_once() -> Dict[str, Any]:
         "vram_used_gb": used_gb,
         "cu_burn_rate_per_hour": cu_rate,
     }
+    if sample_utilization:
+        snap["gpu_utilization_percent"] = _read_gpu_utilization_percent() if cuda_avail else None
+        snap["gpu_utilization_sampled_at"] = time.time()
     snap.update(_get_storage_metrics_dict(refresh_drive=False))
     if "_poll_local_comfyui_runtime_quiet" in globals():
         _poll_local_comfyui_runtime_quiet()
     with _TELEMETRY_LOCK:
+        # On-demand snapshots (including post-cancel VRAM refreshes) reuse the latest driver sample.
+        if not sample_utilization:
+            snap["gpu_utilization_percent"] = _CACHED_LIVE_TELEMETRY.get("gpu_utilization_percent")
+            snap["gpu_utilization_sampled_at"] = _CACHED_LIVE_TELEMETRY.get("gpu_utilization_sampled_at")
         _CACHED_LIVE_TELEMETRY.clear()
         _CACHED_LIVE_TELEMETRY.update(snap)
     return snap
@@ -3400,7 +3433,7 @@ def _telemetry_sampler_loop():
     """独立后台线程以 2s 周期采样 GPU 显存/内存/磁盘指标，保证 HTTP 轮询非阻塞秒回"""
     while True:
         try:
-            _sample_live_hardware_telemetry_once()
+            _sample_live_hardware_telemetry_once(sample_utilization=True)
         except Exception:
             pass
         time.sleep(2.0)
@@ -3472,6 +3505,8 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
         "ok": True,
         "cuda_available": cuda_avail,
         "gpu_name": gpu_name,
+        "gpu_utilization_percent": hw.get("gpu_utilization_percent"),
+        "gpu_utilization_sampled_at": hw.get("gpu_utilization_sampled_at"),
         "vram_free_gb": free_gb,
         "vram_total_gb": total_gb,
         "vram_used_gb": used_gb,

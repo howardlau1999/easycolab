@@ -627,6 +627,8 @@ struct ColabStatusResponse: Codable {
     var ok: Bool?
     var cuda_available: Bool?
     var gpu_name: String?
+    var gpu_utilization_percent: Double?
+    var gpu_utilization_sampled_at: Double?
     var vram_free_gb: Double?
     var vram_total_gb: Double?
     var vram_used_gb: Double?
@@ -865,6 +867,8 @@ struct CompletedMediaItem: Codable, Hashable {
 struct LiveTelemetrySnapshot: Codable {
     var cuda_available: Bool?
     var gpu_name: String?
+    var gpu_utilization_percent: Double?
+    var gpu_utilization_sampled_at: Double?
     var vram_free_gb: Double?
     var vram_total_gb: Double?
     var vram_used_gb: Double?

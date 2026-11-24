@@ -4,70 +4,64 @@ import AVKit
 import UniformTypeIdentifiers
 import ObjectiveC.runtime
 
-// MARK: - 实时硬件资源折线图表组件 (VRAM / RAM / Disk)
+// MARK: - 实时硬件资源折线图表组件
 
 private func buildSmoothTelemetryPaths(
-    samples: [Double],
+    samples: [Double?],
     size: CGSize,
     topInset: CGFloat = 5,
     bottomInset: CGFloat = 4
-) -> (line: Path, area: Path, points: [CGPoint]) {
-    var linePath = Path()
-    var areaPath = Path()
-    guard !samples.isEmpty, size.width > 2, size.height > (topInset + bottomInset + 2) else {
-        return (linePath, areaPath, [])
+) -> (line: Path, area: Path, points: [CGPoint?]) {
+    var line = Path()
+    var area = Path()
+    guard !samples.isEmpty, size.width > 2, size.height > topInset + bottomInset + 2 else {
+        return (line, area, [])
     }
 
-    let usableH = size.height - topInset - bottomInset
-    let pts: [CGPoint]
-    if samples.count == 1 {
-        let y = topInset + usableH * CGFloat(1.0 - min(1.0, max(0.0, samples[0])))
-        pts = [CGPoint(x: 0, y: y), CGPoint(x: size.width, y: y)]
-    } else {
-        let stepX = size.width / CGFloat(samples.count - 1)
-        pts = samples.enumerated().map { idx, val in
-            let clamped = min(1.0, max(0.0, val))
-            let x = CGFloat(idx) * stepX
-            let y = topInset + usableH * CGFloat(1.0 - clamped)
-            return CGPoint(x: x, y: y)
+    let usableHeight = size.height - topInset - bottomInset
+    let points: [CGPoint?] = samples.enumerated().map { index, sample in
+        guard let sample else { return nil }
+        let x = samples.count > 1 ? size.width * CGFloat(index) / CGFloat(samples.count - 1) : size.width
+        let y = topInset + usableHeight * CGFloat(1 - min(1, max(0, sample)))
+        return CGPoint(x: x, y: y)
+    }
+
+    // Keep missing intervals open so a driver outage never looks like 0% GPU usage.
+    var start = 0
+    while start < points.count {
+        guard let first = points[start] else { start += 1; continue }
+        var segment = Path()
+        segment.move(to: first)
+        var end = start
+        var last = first
+        while end + 1 < points.count, let next = points[end + 1] {
+            if abs(next.y - last.y) < 0.25 {
+                segment.addLine(to: next)
+            } else {
+                let previous = end > start ? points[end - 1] ?? last : last
+                let following = end + 2 < points.count ? points[end + 2] ?? next : next
+                let dx = (next.x - last.x) / 3
+                let maxY = size.height - bottomInset
+                let cp1 = CGPoint(x: last.x + dx, y: min(maxY, max(topInset, last.y + (next.y - previous.y) / 6)))
+                let cp2 = CGPoint(x: next.x - dx, y: min(maxY, max(topInset, next.y - (following.y - last.y) / 6)))
+                segment.addCurve(to: next, control1: cp1, control2: cp2)
+            }
+            last = next
+            end += 1
         }
-    }
-
-    let minY = topInset
-    let maxY = size.height - bottomInset
-
-    linePath.move(to: pts[0])
-    for i in 0..<(pts.count - 1) {
-        let p0 = i > 0 ? pts[i - 1] : pts[i]
-        let p1 = pts[i]
-        let p2 = pts[i + 1]
-        let p3 = (i + 2 < pts.count) ? pts[i + 2] : p2
-
-        let dx = p2.x - p1.x
-        // 若相邻区间完全平坦，直接使用直线段防止任何贝塞尔过冲
-        if abs(p2.y - p1.y) < 0.25 {
-            linePath.addLine(to: p2)
+        line.addPath(segment)
+        if end == start {
+            // A single measured point, including the first sample after a gap.
+            line.addEllipse(in: CGRect(x: first.x - 1, y: first.y - 1, width: 2, height: 2))
         } else {
-            let cp1 = CGPoint(
-                x: p1.x + dx / 3.0,
-                y: min(maxY, max(minY, p1.y + (p2.y - p0.y) / 6.0))
-            )
-            let cp2 = CGPoint(
-                x: p2.x - dx / 3.0,
-                y: min(maxY, max(minY, p2.y - (p3.y - p1.y) / 6.0))
-            )
-            linePath.addCurve(to: p2, control1: cp1, control2: cp2)
+            segment.addLine(to: CGPoint(x: last.x, y: size.height))
+            segment.addLine(to: CGPoint(x: first.x, y: size.height))
+            segment.closeSubpath()
+            area.addPath(segment)
         }
+        start = end + 1
     }
-
-    areaPath.addPath(linePath)
-    if let last = pts.last, let first = pts.first {
-        areaPath.addLine(to: CGPoint(x: last.x, y: size.height))
-        areaPath.addLine(to: CGPoint(x: first.x, y: size.height))
-        areaPath.closeSubpath()
-    }
-
-    return (linePath, areaPath, pts)
+    return (line, area, points)
 }
 
 struct TelemetryGridBackground: View {
@@ -100,10 +94,8 @@ struct TelemetryGridBackground: View {
 
 struct SingleMetricLineChartCard: View {
     let title: String
-    let usedGB: Double
-    let freeGB: Double
-    let totalGB: Double
-    let samples: [Double]
+    var capacity: (used: Double, free: Double, total: Double)? = nil
+    let samples: [Double?]
     let accentColor: Color
     let isWarning: Bool
     let isCritical: Bool
@@ -122,8 +114,7 @@ struct SingleMetricLineChartCard: View {
 
     var body: some View {
         let palette = StudioPalette(colorScheme: colorScheme)
-        let currentPct = totalGB > 0 ? min(1.0, max(0.0, usedGB / totalGB)) : 0.0
-        let plotSamples = samples.isEmpty ? Array(repeating: currentPct, count: 14) : samples
+        let currentPct = capacity.map { min(1, max(0, $0.used / $0.total)) } ?? samples.last ?? nil
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 5) {
@@ -136,7 +127,7 @@ struct SingleMetricLineChartCard: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.primary)
 
-                Text(String(format: "%.0f%%", currentPct * 100.0))
+                Text(currentPct.map { String(format: "%.0f%%", $0 * 100) } ?? "—")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
                     .foregroundStyle(effectiveColor)
                     .padding(.horizontal, 5)
@@ -148,17 +139,23 @@ struct SingleMetricLineChartCard: View {
 
                 Spacer(minLength: 4)
 
-                Text(L(
-                    "\(fmt1(usedGB))/\(fmt1(totalGB))G · 余\(fmt1(freeGB))G",
-                    "\(fmt1(usedGB))/\(fmt1(totalGB))G · \(fmt1(freeGB))G free"
-                ))
+                if let capacity {
+                    Text(L(
+                        "\(fmt1(capacity.used))/\(fmt1(capacity.total))G · 余\(fmt1(capacity.free))G",
+                        "\(fmt1(capacity.used))/\(fmt1(capacity.total))G · \(fmt1(capacity.free))G free"
+                    ))
                     .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                     .foregroundStyle(isCritical ? Color.red : (isWarning ? Color.orange : Color.secondary))
                     .lineLimit(1)
+                } else {
+                    Text(currentPct == nil ? L("暂无读数", "Unavailable") : "0–100%")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
             }
 
             GeometryReader { geo in
-                let built = buildSmoothTelemetryPaths(samples: plotSamples, size: geo.size)
+                let built = buildSmoothTelemetryPaths(samples: samples, size: geo.size)
                 let hoverIdx: Int? = {
                     guard let hx = hoverLocationX, geo.size.width > 1, !built.points.isEmpty else { return nil }
                     let ratio = min(1.0, max(0.0, hx / geo.size.width))
@@ -196,10 +193,9 @@ struct SingleMetricLineChartCard: View {
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 6.5))
 
-                    if let hi = hoverIdx, hi < built.points.count, hi < plotSamples.count {
-                        let hp = built.points[hi]
-                        let hPct = plotSamples[hi]
-                        let hGB = hPct * totalGB
+                    if let hi = hoverIdx, let hp = built.points[hi], let hPct = samples[hi] {
+                        let percent = String(format: "%.0f%%", hPct * 100)
+                        let reading = capacity.map { "\(fmt1(hPct * $0.total)) GB (\(percent))" } ?? percent
 
                         Path { p in
                             p.move(to: CGPoint(x: hp.x, y: 0))
@@ -213,7 +209,7 @@ struct SingleMetricLineChartCard: View {
                             .overlay(Circle().stroke(Color.white, lineWidth: 1.2))
                             .position(hp)
 
-                        Text("\(fmt1(hGB)) GB (\(String(format: "%.0f%%", hPct * 100)))")
+                        Text(reading)
                             .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.primary)
                             .padding(.horizontal, 5)
@@ -230,7 +226,7 @@ struct SingleMetricLineChartCard: View {
                                 x: min(max(46, hp.x), geo.size.width - 46),
                                 y: 11
                             )
-                    } else if let lastPt = built.points.last {
+                    } else if let lastPt = built.points.last ?? nil {
                         Circle()
                             .fill(effectiveColor.opacity(0.28))
                             .frame(width: 10, height: 10)
@@ -271,19 +267,21 @@ struct SingleMetricLineChartCard: View {
 }
 
 struct CombinedMultiMetricChartCard: View {
+    let gpuSamples: [Double?]
     let vramUsed: Double
     let vramTotal: Double
-    let vramSamples: [Double]
+    let vramSamples: [Double?]
     let ramUsed: Double
     let ramTotal: Double
-    let ramSamples: [Double]
+    let ramSamples: [Double?]
     let diskUsed: Double
     let diskTotal: Double
-    let diskSamples: [Double]
+    let diskSamples: [Double?]
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var hoverX: CGFloat? = nil
 
+    static let gpuColor = Color.purple
     private let vramColor = Color(red: 0.33, green: 0.53, blue: 0.98)
     private let ramColor = Color(red: 0.10, green: 0.76, blue: 0.53)
     private let diskColor = Color(red: 0.05, green: 0.73, blue: 0.88)
@@ -298,15 +296,13 @@ struct CombinedMultiMetricChartCard: View {
         let rPct = ramTotal > 0 ? min(1.0, max(0.0, ramUsed / ramTotal)) : 0.0
         let dPct = diskTotal > 0 ? min(1.0, max(0.0, diskUsed / diskTotal)) : 0.0
 
-        let vSeries = vramSamples.isEmpty ? Array(repeating: vPct, count: 14) : vramSamples
-        let rSeries = ramSamples.isEmpty ? Array(repeating: rPct, count: 14) : ramSamples
-        let dSeries = diskSamples.isEmpty ? Array(repeating: dPct, count: 14) : diskSamples
 
         VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
-                let vBuilt = buildSmoothTelemetryPaths(samples: vSeries, size: geo.size, topInset: 6, bottomInset: 5)
-                let rBuilt = buildSmoothTelemetryPaths(samples: rSeries, size: geo.size, topInset: 6, bottomInset: 5)
-                let dBuilt = buildSmoothTelemetryPaths(samples: dSeries, size: geo.size, topInset: 6, bottomInset: 5)
+                let gBuilt = buildSmoothTelemetryPaths(samples: gpuSamples, size: geo.size, topInset: 6, bottomInset: 5)
+                let vBuilt = buildSmoothTelemetryPaths(samples: vramSamples, size: geo.size, topInset: 6, bottomInset: 5)
+                let rBuilt = buildSmoothTelemetryPaths(samples: ramSamples, size: geo.size, topInset: 6, bottomInset: 5)
+                let dBuilt = buildSmoothTelemetryPaths(samples: diskSamples, size: geo.size, topInset: 6, bottomInset: 5)
 
                 ZStack(alignment: .topLeading) {
                     RoundedRectangle(cornerRadius: 7)
@@ -357,6 +353,10 @@ struct CombinedMultiMetricChartCard: View {
                             .clipShape(RoundedRectangle(cornerRadius: 7))
                     }
 
+                    gBuilt.line
+                        .stroke(Self.gpuColor, style: StrokeStyle(lineWidth: 1.85, lineCap: .round, lineJoin: .round))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+
                     if let hx = hoverX, geo.size.width > 1 {
                         let clampedX = min(geo.size.width, max(0, hx))
                         Path { p in
@@ -365,13 +365,16 @@ struct CombinedMultiMetricChartCard: View {
                         }
                         .stroke(Color.primary.opacity(0.32), style: StrokeStyle(lineWidth: 1.0, dash: [2.5, 2.5]))
                     } else {
-                        if vramTotal > 0, let lp = vBuilt.points.last {
+                        if let lp = gBuilt.points.last ?? nil {
+                            Circle().fill(Self.gpuColor).frame(width: 5, height: 5).position(lp)
+                        }
+                        if vramTotal > 0, let lp = vBuilt.points.last ?? nil {
                             Circle().fill(vramColor).frame(width: 5, height: 5).position(lp)
                         }
-                        if ramTotal > 0, let lp = rBuilt.points.last {
+                        if ramTotal > 0, let lp = rBuilt.points.last ?? nil {
                             Circle().fill(ramColor).frame(width: 5, height: 5).position(lp)
                         }
-                        if diskTotal > 0, let lp = dBuilt.points.last {
+                        if diskTotal > 0, let lp = dBuilt.points.last ?? nil {
                             Circle().fill(diskColor).frame(width: 5, height: 5).position(lp)
                         }
                     }
@@ -392,14 +395,15 @@ struct CombinedMultiMetricChartCard: View {
             .frame(height: 88)
 
             VStack(spacing: 3.5) {
+                legendRow(color: Self.gpuColor, label: L("GPU 利用率", "GPU utilization"), pct: gpuSamples.last ?? nil)
                 if vramTotal > 0 {
-                    legendRow(color: vramColor, label: L("显存 VRAM", "VRAM"), pct: vPct, used: vramUsed, total: vramTotal)
+                    legendRow(color: vramColor, label: L("显存 VRAM", "VRAM"), pct: vPct, capacity: (vramUsed, vramTotal))
                 }
                 if ramTotal > 0 {
-                    legendRow(color: ramColor, label: L("内存 RAM", "System RAM"), pct: rPct, used: ramUsed, total: ramTotal)
+                    legendRow(color: ramColor, label: L("内存 RAM", "System RAM"), pct: rPct, capacity: (ramUsed, ramTotal))
                 }
                 if diskTotal > 0 {
-                    legendRow(color: diskColor, label: L("硬盘 Disk", "Disk"), pct: dPct, used: diskUsed, total: diskTotal)
+                    legendRow(color: diskColor, label: L("硬盘 Disk", "Disk"), pct: dPct, capacity: (diskUsed, diskTotal))
                 }
             }
         }
@@ -415,7 +419,7 @@ struct CombinedMultiMetricChartCard: View {
     }
 
     @ViewBuilder
-    private func legendRow(color: Color, label: String, pct: Double, used: Double, total: Double) -> some View {
+    private func legendRow(color: Color, label: String, pct: Double?, capacity: (used: Double, total: Double)? = nil) -> some View {
         HStack(spacing: 5) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(color)
@@ -424,10 +428,12 @@ struct CombinedMultiMetricChartCard: View {
                 .font(.system(size: 10.5, weight: .medium))
                 .foregroundStyle(.secondary)
             Spacer()
-            Text("\(fmt1(used)) / \(fmt1(total)) GB")
-                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary)
-            Text(String(format: "%3.0f%%", pct * 100))
+            if let capacity {
+                Text("\(fmt1(capacity.used)) / \(fmt1(capacity.total)) GB")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.primary)
+            }
+            Text(pct.map { String(format: "%3.0f%%", $0 * 100) } ?? "—")
                 .font(.system(size: 10.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(color)
                 .frame(width: 34, alignment: .trailing)

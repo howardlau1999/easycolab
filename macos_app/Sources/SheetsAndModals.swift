@@ -471,8 +471,8 @@ struct ColabGuideSheet: View {
             number: "3",
             title: L("右侧实时日志与折线图监控", "Live Telemetry Charts & Real-Time Run Logs"),
             detail: L(
-                "左下角算力卡片提供显存、系统内存与磁盘折线走势图（点切换按钮可合并/展开三线对比）；右侧独立面板实时滚动下载速率、采样步进度与预计剩余时间。",
-                "The left compute card plots live VRAM, System RAM, and Disk curves (toggle between Split and Combined views), while the collapsible right log panel streams live download speeds, sampling steps, and ETA."
+                "左侧算力卡片显示 GPU 利用率，以及显存、系统内存和磁盘占用。可用「分项」和「同屏」切换曲线视图。右侧日志显示下载速率、采样进度和预计剩余时间。",
+                "The compute card on the left charts GPU utilization alongside VRAM, system memory, and disk usage. Switch between Split and Combined views to compare them. The log on the right shows download speeds, sampling progress, and time remaining."
             ),
             palette: palette
         ) { EmptyView() }

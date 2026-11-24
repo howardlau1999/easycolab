@@ -64,6 +64,7 @@ class StudioViewModel: ObservableObject {
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
         didSet {
             if Self.normalizeServerURL(oldValue) != Self.normalizeServerURL(colabServerURL) {
+                resetTelemetryHistory()
                 serverEditReferenceLimit = nil
                 imagePEStatus = nil
                 imagePEJobID = nil
@@ -157,6 +158,7 @@ class StudioViewModel: ObservableObject {
     @Published var isConnected: Bool = false {
         didSet {
             if !isConnected {
+                resetTelemetryHistory()
                 serverEditReferenceLimit = nil
                 imagePEStatus = nil
                 submittingImagePEDownload = false
@@ -182,9 +184,17 @@ class StudioViewModel: ObservableObject {
     @Published var driveTotalGB: Double = 0.0
     @Published var driveUsedGB: Double = 0.0
     @Published var driveFreeGB: Double = 0.0
-    @Published var vramHistoryPct: [Double] = []
-    @Published var ramHistoryPct: [Double] = []
-    @Published var diskHistoryPct: [Double] = []
+    private struct TelemetrySample {
+        var gpu: Double?
+        var vram: Double?
+        var ram: Double?
+        var disk: Double?
+    }
+    @Published private var telemetryHistory: [TelemetrySample] = []
+    var gpuUtilizationHistory: [Double?] { telemetryHistory.map(\.gpu) }
+    var vramHistoryPct: [Double?] { telemetryHistory.map(\.vram) }
+    var ramHistoryPct: [Double?] { telemetryHistory.map(\.ram) }
+    var diskHistoryPct: [Double?] { telemetryHistory.map(\.disk) }
     @Published var combinedTelemetryChartMode: Bool = false
     @Published var selectedModelId: String = "minimax_h3"
     @Published var customModels: [OpenModelSpec] = []
@@ -460,6 +470,9 @@ class StudioViewModel: ObservableObject {
     var generationStartedAt: Date? = nil
     var consecutiveStatusFailures: Int = 0
     var lastTelemetrySampleDate: Date = .distantPast
+    private var lastGPUSampleTimestamp: Double?
+    private var lastGPUReadingDate: Date = .distantPast
+    private let gpuReadingLifetime: TimeInterval = 12
     let maxTelemetrySamples: Int = 48
 
     // macOS 防 App Nap 休眠断言与常驻外部 Runtime Proxy 保活守护进程状态
@@ -494,48 +507,60 @@ class StudioViewModel: ObservableObject {
         }
     }
 
-    func recordTelemetrySample(force: Bool = false) {
-        let now = Date()
-        if !force && now.timeIntervalSince(lastTelemetrySampleDate) < 0.85 {
-            return
-        }
+    private func resetTelemetryHistory() {
+        lastGPUSampleTimestamp = nil
+        lastGPUReadingDate = .distantPast
+        lastTelemetrySampleDate = .distantPast
+        telemetryHistory.removeAll()
+    }
+
+    private func appendTelemetry(_ sample: TelemetrySample, at now: Date) {
         lastTelemetrySampleDate = now
+        telemetryHistory.append(sample)
+        if telemetryHistory.count > maxTelemetrySamples { telemetryHistory.removeFirst() }
+    }
 
-        if vramTotalGB > 0 {
-            let pct = min(1.0, max(0.0, vramUsedGB / vramTotalGB))
-            if vramHistoryPct.isEmpty {
-                vramHistoryPct = Array(repeating: pct, count: 14)
-            } else {
-                vramHistoryPct.append(pct)
-                if vramHistoryPct.count > maxTelemetrySamples {
-                    vramHistoryPct.removeFirst(vramHistoryPct.count - maxTelemetrySamples)
+    func expireGPUUtilizationIfNeeded(now: Date = Date()) {
+        if telemetryHistory.last?.gpu != nil && now.timeIntervalSince(lastGPUReadingDate) > gpuReadingLifetime {
+            appendTelemetry(TelemetrySample(), at: now)
+        }
+    }
+
+    func recordTelemetrySample(gpuPercent: Double?, sampledAt: Double?, now: Date = Date()) {
+        func usage(_ used: Double, _ total: Double) -> Double? {
+            total > 0 ? min(1, max(0, used / total)) : nil
+        }
+        var sample = TelemetrySample(
+            gpu: gpuPercent.flatMap { (0...100).contains($0) ? $0 / 100 : nil },
+            vram: usage(vramUsedGB, vramTotalGB), ram: usage(ramUsedGB, ramTotalGB),
+            disk: usage(diskUsedGB, diskTotalGB)
+        )
+        expireGPUUtilizationIfNeeded(now: now)
+        let timestamp = sampledAt.flatMap { $0.isFinite ? $0 : nil }
+        if let previous = lastGPUSampleTimestamp {
+            if let timestamp, timestamp < previous { return }
+            if timestamp == nil || timestamp == previous {
+                // Polls can share a GPU sample even when memory has already changed.
+                if now.timeIntervalSince(lastGPUReadingDate) <= gpuReadingLifetime ||
+                    now.timeIntervalSince(lastTelemetrySampleDate) < 0.85 {
+                    if let index = telemetryHistory.indices.last {
+                        sample.gpu = telemetryHistory[index].gpu
+                        telemetryHistory[index] = sample
+                    }
+                    return
                 }
+                sample.gpu = nil
             }
         }
-
-        if ramTotalGB > 0 {
-            let pct = min(1.0, max(0.0, ramUsedGB / ramTotalGB))
-            if ramHistoryPct.isEmpty {
-                ramHistoryPct = Array(repeating: pct, count: 14)
-            } else {
-                ramHistoryPct.append(pct)
-                if ramHistoryPct.count > maxTelemetrySamples {
-                    ramHistoryPct.removeFirst(ramHistoryPct.count - maxTelemetrySamples)
-                }
-            }
+        if let timestamp {
+            lastGPUSampleTimestamp = timestamp
+            lastGPUReadingDate = min(now, Date(timeIntervalSince1970: timestamp))
+            if now.timeIntervalSince(lastGPUReadingDate) > gpuReadingLifetime { sample.gpu = nil }
+        } else {
+            guard now.timeIntervalSince(lastTelemetrySampleDate) >= 0.85 else { return }
+            if lastGPUSampleTimestamp == nil { lastGPUReadingDate = now }
         }
-
-        if diskTotalGB > 0 {
-            let pct = min(1.0, max(0.0, diskUsedGB / diskTotalGB))
-            if diskHistoryPct.isEmpty {
-                diskHistoryPct = Array(repeating: pct, count: 14)
-            } else {
-                diskHistoryPct.append(pct)
-                if diskHistoryPct.count > maxTelemetrySamples {
-                    diskHistoryPct.removeFirst(diskHistoryPct.count - maxTelemetrySamples)
-                }
-            }
-        }
+        appendTelemetry(sample, at: now)
     }
 
     func applyLiveTelemetrySnapshot(_ snap: LiveTelemetrySnapshot) {
@@ -556,7 +581,7 @@ class StudioViewModel: ObservableObject {
         if let gt = snap.drive_total_gb, gt > 0 { driveTotalGB = gt }
         if let gu = snap.drive_used_gb { driveUsedGB = gu }
         if let gf = snap.drive_free_gb { driveFreeGB = gf }
-        recordTelemetrySample()
+        recordTelemetrySample(gpuPercent: snap.gpu_utilization_percent, sampledAt: snap.gpu_utilization_sampled_at)
     }
 
     func elapsedForMedia(_ url: URL?) -> Double? {
@@ -640,10 +665,6 @@ class StudioViewModel: ObservableObject {
         driveTotalGB = 0.0
         driveUsedGB = 0.0
         driveFreeGB = 0.0
-        vramHistoryPct = []
-        ramHistoryPct = []
-        diskHistoryPct = []
-        lastTelemetrySampleDate = .distantPast
         cuBurnRatePerHour = 0.0
         loadedContextLengthTokens = 0
         remoteContextSynced = false
@@ -857,7 +878,7 @@ class StudioViewModel: ObservableObject {
             req.httpBody = try JSONSerialization.data(withJSONObject: ["model_id": modelId])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
             if isSelectedModelLoadedInVRAM {
                 statusMessage = L(
                     "\(activeModelSpec.name) 已驻留 GPU 显存，可直接开始推理！",
@@ -990,7 +1011,7 @@ class StudioViewModel: ObservableObject {
             consecutiveStatusFailures = 0
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
             imagePEStatus = decoded.image_pe
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             if !silent {
                 if isSelectedModelLoadedInVRAM {
@@ -1046,7 +1067,7 @@ class StudioViewModel: ObservableObject {
             if decoded.idle_timeout_minutes == minutes {
                 remoteIdleSynced = true
             }
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
         } catch {}
     }
 
@@ -1109,14 +1130,14 @@ class StudioViewModel: ObservableObject {
             ])
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             while isDownloadingWeights {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if let statusURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
                    let (sData, _) = try? await adminSession.data(for: adminRequest(statusURL)),
                    let sDecoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
-                    applyStatusResponse(sDecoded)
+                    applyStatusResponse(sDecoded, from: base)
                     if let msg = sDecoded.task_message, !msg.isEmpty { statusMessage = msg }
                     if !(sDecoded.is_downloading ?? false) {
                         isDownloadingWeights = false
@@ -1181,14 +1202,14 @@ class StudioViewModel: ObservableObject {
 
             let (data, _) = try await adminSession.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-            applyStatusResponse(decoded)
+            applyStatusResponse(decoded, from: base)
 
             while isLoadingModel {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if let statusURL = URL(string: "\(base)/minimax_api/status?model_id=\(targetModel)"),
                    let (sData, _) = try? await adminSession.data(for: adminRequest(statusURL)),
                    let sDecoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: sData) {
-                    applyStatusResponse(sDecoded)
+                    applyStatusResponse(sDecoded, from: base)
                     if let msg = sDecoded.task_message, !msg.isEmpty { statusMessage = msg }
                     if !(sDecoded.is_loading_vram ?? false) {
                         isLoadingModel = false
@@ -1242,7 +1263,7 @@ class StudioViewModel: ObservableObject {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 200 {
                 let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
-                applyStatusResponse(decoded)
+                applyStatusResponse(decoded, from: base)
                 if let msg = decoded.task_message, !msg.isEmpty {
                     statusMessage = msg
                 } else {
@@ -1308,7 +1329,7 @@ class StudioViewModel: ObservableObject {
             guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
             guard normalizedBaseURL == base else { return }
             if let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
-                applyStatusResponse(decoded)
+                applyStatusResponse(decoded, from: base)
             }
             stripConsoleProgressBars()
             statusMessage = L(
@@ -1596,7 +1617,7 @@ class StudioViewModel: ObservableObject {
                 consecutivePollErrors = 0
                 let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
                 updateImagePE(from: job)
-                if let tl = job.telemetry {
+                if isConnected, baseURL == normalizedBaseURL, let tl = job.telemetry {
                     applyLiveTelemetrySnapshot(tl)
                 }
                 // 在文件彻底生成并下载回本地预览前，进度条最高锁定在 98%，杜绝“显示 100% 但视频尚未出来”
@@ -1807,10 +1828,6 @@ class StudioViewModel: ObservableObject {
         driveTotalGB = 0.0
         driveUsedGB = 0.0
         driveFreeGB = 0.0
-        vramHistoryPct = []
-        ramHistoryPct = []
-        diskHistoryPct = []
-        lastTelemetrySampleDate = .distantPast
         remoteContextSynced = false
         remoteIdleSynced = false
         remoteApiKeySynced = false

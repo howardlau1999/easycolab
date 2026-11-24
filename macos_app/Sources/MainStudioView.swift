@@ -569,7 +569,7 @@ struct MainStudioView: View {
                         .padding(.vertical, 1.5)
                         .background(Capsule().fill(Color.primary.opacity(0.055)))
                 }
-                if vm.vramTotalGB > 0 || vm.ramTotalGB > 0 || vm.diskTotalGB > 0 {
+                if vm.isConnected || vm.vramTotalGB > 0 || vm.ramTotalGB > 0 || vm.diskTotalGB > 0 {
                     Button {
                         withAnimation(.easeInOut(duration: 0.18)) {
                             vm.combinedTelemetryChartMode.toggle()
@@ -591,14 +591,15 @@ struct MainStudioView: View {
                     }
                     .buttonStyle(.plain)
                     .help(vm.combinedTelemetryChartMode
-                          ? L("切换为显存/内存/硬盘独立折线面积图", "Switch to separate VRAM / RAM / Disk area charts")
-                          : L("切换为显存/内存/硬盘三线同屏对比图", "Switch to combined 3-line telemetry comparison chart"))
+                          ? L("切换为 GPU、显存、内存与硬盘分项曲线", "Show separate GPU, VRAM, RAM and disk charts")
+                          : L("切换为同屏对比曲线", "Show all metrics on one chart"))
                 }
             }
 
-            if vm.vramTotalGB > 0 || vm.ramTotalGB > 0 || vm.diskTotalGB > 0 {
+            if vm.isConnected || vm.vramTotalGB > 0 || vm.ramTotalGB > 0 || vm.diskTotalGB > 0 {
                 if vm.combinedTelemetryChartMode {
                     CombinedMultiMetricChartCard(
+                        gpuSamples: vm.gpuUtilizationHistory,
                         vramUsed: vm.vramUsedGB,
                         vramTotal: vm.vramTotalGB,
                         vramSamples: vm.vramHistoryPct,
@@ -609,15 +610,21 @@ struct MainStudioView: View {
                         diskTotal: vm.diskTotalGB,
                         diskSamples: vm.diskHistoryPct
                     )
-                    .help(L("三线实时对比：显存 VRAM / 系统内存 RAM / 硬盘 Disk", "Live 3-metric comparison: VRAM / System RAM / Disk"))
+                    .help(L("同屏比较 GPU 利用率与显存、内存、硬盘用量", "Compare GPU utilization with VRAM, RAM and disk usage"))
                 } else {
                     VStack(spacing: 5.5) {
+                        SingleMetricLineChartCard(
+                            title: L("GPU 利用率", "GPU utilization"),
+                            samples: vm.gpuUtilizationHistory,
+                            accentColor: CombinedMultiMetricChartCard.gpuColor,
+                            isWarning: false,
+                            isCritical: false
+                        )
+                        .help(L("GPU 在采样期间执行运算的时间占比。悬停查看历史读数。", "Time the GPU spent executing kernels during the sample. Hover to inspect earlier readings."))
                         if vm.vramTotalGB > 0 {
                             SingleMetricLineChartCard(
                                 title: L("显存 VRAM", "VRAM"),
-                                usedGB: vm.vramUsedGB,
-                                freeGB: vm.vramFreeGB,
-                                totalGB: vm.vramTotalGB,
+                                capacity: (vm.vramUsedGB, vm.vramFreeGB, vm.vramTotalGB),
                                 samples: vm.vramHistoryPct,
                                 accentColor: Color(red: 0.33, green: 0.53, blue: 0.98),
                                 isWarning: vm.vramFreeGB < 8.0,
@@ -628,9 +635,7 @@ struct MainStudioView: View {
                         if vm.ramTotalGB > 0 {
                             SingleMetricLineChartCard(
                                 title: L("内存 RAM", "System RAM"),
-                                usedGB: vm.ramUsedGB,
-                                freeGB: vm.ramFreeGB,
-                                totalGB: vm.ramTotalGB,
+                                capacity: (vm.ramUsedGB, vm.ramFreeGB, vm.ramTotalGB),
                                 samples: vm.ramHistoryPct,
                                 accentColor: Color(red: 0.10, green: 0.76, blue: 0.53),
                                 isWarning: vm.ramFreeGB < 10.0,
@@ -641,9 +646,7 @@ struct MainStudioView: View {
                         if vm.diskTotalGB > 0 {
                             SingleMetricLineChartCard(
                                 title: L("硬盘 Disk", "Disk"),
-                                usedGB: vm.diskUsedGB,
-                                freeGB: vm.diskFreeGB,
-                                totalGB: vm.diskTotalGB,
+                                capacity: (vm.diskUsedGB, vm.diskFreeGB, vm.diskTotalGB),
                                 samples: vm.diskHistoryPct,
                                 accentColor: Color(red: 0.05, green: 0.73, blue: 0.88),
                                 isWarning: vm.diskFreeGB < 20.0,

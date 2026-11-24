@@ -23,7 +23,7 @@ Headless Drive mounting can still copy a Google refresh token with Colab and Clo
 - **Cross-Platform Native Studio + Bilingual UI Toggle + Interactive Onboarding (1:1 Parity Across macOS, Windows & Linux)**
   - **macOS Client** is crafted natively with SwiftUI + AppKit; **Windows & Linux Clients** are built with PySide6 (Qt6 + FFmpeg multimedia pipeline) featuring high-DPI scaling. All include a **4-step interactive onboarding wizard** on first launch with zero-config bridge initialization.
   - Built-in **one-click Chinese / English (`中文 / EN`) live UI toggle** (defaults to Chinese), persisting language preferences automatically without restarting the app.
-  - Real-time smooth Catmull-Rom spline telemetry charts for cloud **GPU VRAM / System RAM / Disk Space** (supporting both split and combined overlay modes), paired with official **Compute Unit (CU) balance** and hourly burn-rate tracking.
+  - Track cloud **VRAM, system memory, and disk usage** in split or combined charts alongside the **Compute Unit (CU) balance** and hourly consumption. The Mac compute card also charts **GPU utilization** so you can compare GPU activity with memory use throughout a job.
   - Built-in **30-minute idle auto-sleep watchdog** and one-click **"Release All Instances"** to prevent forgotten runtimes from draining your CU quota.
 
 - **Four Flagship Open-Source Multimodal Engines Out of the Box**
