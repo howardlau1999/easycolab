@@ -10871,7 +10871,7 @@ def create_ui() -> gr.Blocks:
                     output_video = gr.Video(
                         label="🎞️ 生成结果预览 (请开启播放器声音体验原生立体声)",
                         height=420,
-                        autoplay=True,
+                        autoplay=False,
                     )
                     run_status_box = gr.Textbox(
                         label="运行日志与状态",

@@ -527,7 +527,7 @@ struct GalleryTabView: View {
     private func syncActivePlayerIfNeeded() {
         guard let active = activeItem else { return }
         if vm.currentMediaURL?.standardizedFileURL != active.url.standardizedFileURL || (!active.isImage && vm.player == nil) {
-            vm.selectMedia(active.url, autoPlay: false)
+            vm.selectMedia(active.url)
         }
     }
 
@@ -616,7 +616,7 @@ struct GalleryTabView: View {
     private func galleryGridCell(_ item: LocalMediaItem) -> some View {
         let isSelected = activeItem?.url.standardizedFileURL == item.url.standardizedFileURL
         return Button {
-            vm.selectMedia(item.url, autoPlay: true)
+            vm.selectMedia(item.url)
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 ZStack(alignment: .bottomTrailing) {

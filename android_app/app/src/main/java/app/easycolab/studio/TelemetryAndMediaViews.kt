@@ -332,7 +332,6 @@ private fun BezierMultiLineCanvas(
 @Composable
 fun ExoVideoPlayerView(
     videoFile: File,
-    autoPlay: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -342,10 +341,10 @@ fun ExoVideoPlayerView(
         }
     }
 
-    LaunchedEffect(videoFile.absolutePath) {
+    LaunchedEffect(exoPlayer, videoFile.absolutePath) {
+        exoPlayer.pause()
         exoPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(videoFile)))
         exoPlayer.prepare()
-        exoPlayer.playWhenReady = autoPlay
     }
 
     DisposableEffect(exoPlayer) {
@@ -452,7 +451,6 @@ fun MediaStageCard(vm: StudioViewModel) {
             if (isVideo) {
                 ExoVideoPlayerView(
                     videoFile = file,
-                    autoPlay = true,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(250.dp)

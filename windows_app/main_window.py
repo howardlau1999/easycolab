@@ -265,7 +265,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         self._refresh_media_gallery()
         if cur_media is not None and cur_media.exists():
             el = self.vm.media_elapsed_map.get(cur_media.name)
-            self.media_preview.load_media(cur_media, elapsed_seconds=el, auto_play=False)
+            self.media_preview.load_media(cur_media, elapsed_seconds=el)
 
     def _apply_theme(self) -> None:
         pal = self.palette_obj
@@ -2033,14 +2033,14 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
                 btn = QPushButton(f"{ic} {item.filename[:22]}\n{ts_str}{el_str}")
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setStyleSheet("QPushButton { text-align: left; padding: 6px 8px; font-size: 11px; }")
-                btn.clicked.connect(lambda _c=False, p=item.path: self.vm.select_local_media(p, auto_play=True))
+                btn.clicked.connect(lambda _c=False, p=item.path: self.vm.select_local_media(p))
                 self.local_gallery_lay.addWidget(btn)
         self.local_gallery_lay.addStretch(1)
 
-    def _on_media_selected(self, path_obj: object, elapsed_obj: object, auto_play: bool) -> None:
+    def _on_media_selected(self, path_obj: object, elapsed_obj: object) -> None:
         p = path_obj if isinstance(path_obj, Path) else None
         el = float(elapsed_obj) if isinstance(elapsed_obj, (int, float)) else None
-        self.media_preview.load_media(p, elapsed_seconds=el, auto_play=auto_play)
+        self.media_preview.load_media(p, elapsed_seconds=el)
 
     @staticmethod
     def _clear_layout(layout) -> None:

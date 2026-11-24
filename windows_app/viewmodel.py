@@ -93,7 +93,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
     console_changed = Signal()
     chat_changed = Signal()
     media_list_changed = Signal()
-    media_selected = Signal(object, object, bool)  # (Path | None, elapsed: float | None, auto_play: bool)
+    media_selected = Signal(object, object)  # (Path | None, elapsed: float | None)
     theme_changed = Signal()
     language_changed = Signal()
 
@@ -608,12 +608,12 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.media_list_changed.emit()
 
         if auto_select_first and self.current_media_path is None and found:
-            self.select_local_media(found[0].path, auto_play=False)
+            self.select_local_media(found[0].path)
 
-    def select_local_media(self, path: Optional[Path], auto_play: bool = True) -> None:
+    def select_local_media(self, path: Optional[Path]) -> None:
         self.current_media_path = path
         elapsed = self.media_elapsed_map.get(path.name) if path else None
-        self.media_selected.emit(path, elapsed, auto_play)
+        self.media_selected.emit(path, elapsed)
 
     def export_or_reveal_notebook(self) -> None:
         nb_src = resolve_resource_path("EasyColab_Server.ipynb")
@@ -1516,7 +1516,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 if saved_files:
                     self.refresh_local_media_gallery(auto_select_first=False)
                     latest_path, latest_el = saved_files[-1]
-                    self.select_local_media(latest_path, auto_play=True)
+                    self.select_local_media(latest_path)
 
                 if st == "completed":
                     self.is_generating = False

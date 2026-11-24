@@ -965,18 +965,17 @@ extension IOSStudioViewModel {
             currentMediaURL = nil
         }
         if currentMediaURL == nil, let first = items.first {
-            selectMedia(first.url, autoPlay: false)
+            selectMedia(first.url)
         }
     }
 
-    func selectMedia(_ url: URL, autoPlay: Bool = true) {
+    func selectMedia(_ url: URL) {
+        player?.pause()
         currentMediaURL = url
         if url.pathExtension.lowercased() == "mp4" {
             currentPreviewImage = nil
             player = AVPlayer(url: url)
-            if autoPlay { player?.play() }
         } else {
-            player?.pause()
             player = nil
             currentPreviewImage = UIImage(contentsOfFile: url.path)
         }
@@ -1028,7 +1027,7 @@ extension IOSStudioViewModel {
                 mediaElapsedMap[filename] = el
             }
             refreshLocalMedia()
-            selectMedia(destURL, autoPlay: true)
+            selectMedia(destURL)
 
             if autoSaveToPhotos && !alreadyExists {
                 await saveMediaToSystemPhotos(url: destURL, silent: true)

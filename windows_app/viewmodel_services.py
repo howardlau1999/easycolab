@@ -1592,7 +1592,7 @@ class ViewModelServicesMixin:
                             f"Saved locally: {dst.name}",
                         )
                         self.refresh_local_media_gallery(auto_select_first=False)
-                        self.select_local_media(dst, auto_play=True)
+                        self.select_local_media(dst)
                         self.state_changed.emit()
 
                     self._dispatch_ui(on_saved)

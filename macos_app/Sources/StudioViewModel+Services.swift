@@ -621,14 +621,13 @@ extension StudioViewModel {
     }
 
     func selectMedia(_ url: URL) {
+        player?.pause()
         currentMediaURL = url
         let ext = url.pathExtension.lowercased()
-        if ext == "mp4" {
+        if ["mp4", "mov", "webm"].contains(ext) {
             currentPreviewImage = nil
             player = AVPlayer(url: url)
-            player?.play()
         } else {
-            player?.pause()
             player = nil
             currentPreviewImage = NSImage(contentsOf: url)
         }
@@ -1595,17 +1594,7 @@ extension StudioViewModel {
             }
             try FileManager.default.moveItem(at: tmpURL, to: dstURL)
             refreshLocalMedia()
-            let ext = dstURL.pathExtension.lowercased()
-            currentMediaURL = dstURL
-            if ["png", "jpg", "jpeg", "webp", "gif"].contains(ext), let img = NSImage(contentsOf: dstURL) {
-                player?.pause()
-                player = nil
-                currentPreviewImage = img
-            } else {
-                currentPreviewImage = nil
-                player = AVPlayer(url: dstURL)
-                player?.play()
-            }
+            selectMedia(dstURL)
             statusMessage = L(
                 "已将 ComfyUI 成片保存至本地目录: \(dstURL.lastPathComponent)",
                 "Saved ComfyUI output to local folder: \(dstURL.lastPathComponent)"

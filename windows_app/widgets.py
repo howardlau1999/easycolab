@@ -940,8 +940,8 @@ class MediaPreviewWidget(QFrame):
         ep_layout = QVBoxLayout(self.empty_page)
         ep_lbl = QLabel(
             tr(
-                "生成的有声视频与高清海报将自动回传并在此播放\n支持 24 FPS 视频 + 32 kHz 立体声音轨实时预览",
-                "Generated audio-videos & HD images are automatically saved and played here\nSupports real-time 24 FPS video + 32 kHz stereo audio preview",
+                "生成的视频和图片会自动保存到本地，供你在此预览\n支持 24 FPS 视频 + 32 kHz 立体声音轨实时预览",
+                "Generated videos and images are saved locally for preview here\nSupports real-time 24 FPS video + 32 kHz stereo audio preview",
             )
         )
         ep_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1066,7 +1066,7 @@ class MediaPreviewWidget(QFrame):
             )
             self.empty_page.setStyleSheet("background-color: #F1F5F9;")
 
-    def load_media(self, path: Optional[Path], elapsed_seconds: Optional[float] = None, auto_play: bool = True) -> None:
+    def load_media(self, path: Optional[Path], elapsed_seconds: Optional[float] = None) -> None:
         self._current_path = path
         if elapsed_seconds is not None and elapsed_seconds > 0:
             self.elapsed_badge.setText(
@@ -1103,8 +1103,6 @@ class MediaPreviewWidget(QFrame):
             if self.player is not None:
                 self.player.stop()
                 self.player.setSource(QUrl.fromLocalFile(str(path.resolve())))
-                if auto_play:
-                    self.player.play()
 
     def stop_video(self) -> None:
         if self.player is not None:
