@@ -1236,8 +1236,25 @@ extension MainStudioView {
             if mod == .image {
                 Toggle(L("使用 MiniMax-H3-Image-PE 增强提示词", "Expand prompt with MiniMax-H3-Image-PE"), isOn: $vm.enhanceImagePrompt)
                     .font(.caption)
-                if vm.enhanceImagePrompt {
+                if vm.enhanceImagePrompt || vm.imagePEJobProgress != nil || vm.imagePEStatus?.downloading == true {
                     imagePEPreparation
+                }
+                if let prompt = vm.expandedImagePrompt {
+                    HStack(alignment: .firstTextBaseline) {
+                        DisclosureGroup(L("本次任务的 PE 增强提示词", "PE-expanded prompt for this job"), isExpanded: $showExpandedImagePrompt) {
+                            Text(verbatim: prompt)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(prompt, forType: .string)
+                        } label: {
+                            Label(L("复制", "Copy"), systemImage: "doc.on.doc")
+                        }
+                        .controlSize(.small)
+                    }
                 }
             }
 
@@ -1289,6 +1306,21 @@ extension MainStudioView {
     @ViewBuilder
     private var imagePEPreparation: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let progress = vm.imagePEJobProgress {
+                if let fraction = progress.fraction {
+                    HStack {
+                        Text(progress.title)
+                        Spacer()
+                        Text("\(Int(fraction * 100))%").monospacedDigit()
+                    }
+                    ProgressView(value: fraction).accessibilityLabel(progress.title)
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(progress.title)
+                    }
+                }
+            }
             if !vm.isConnected {
                 Text(L("连接 Colab 后可查看和预下载 PE 权重（约 17 GB）。", "Connect to Colab to check or download the PE weights (about 17 GB)."))
             } else if let pe = vm.imagePEStatus {
@@ -1296,18 +1328,20 @@ extension MainStudioView {
                     Label(L("已配置远程 PE 服务，生成时会将提示词和修图参考图发送给该服务。", "Prompts and edit references will be sent to the configured PE service."), systemImage: "network")
                 } else {
                     let editing = vm.taskModeId == "i2i_edit"
-                    imagePEFile(L("PE 权重（约 17 GB）", "PE weights (about 17 GB)"), cached: pe.weights_cached)
-                    if editing {
-                        imagePEFile(L("修图视觉投影器（约 931 MB）", "Edit vision projector (about 931 MB)"), cached: pe.projector_cached)
+                    imagePEFile(L("PE 权重", "PE weights"), expectedSize: L("约 17 GB", "about 17 GB"),
+                                cached: pe.weights_cached, downloading: pe.weights_downloading ?? pe.downloading,
+                                bytes: pe.weights_bytes, total: pe.weights_total_bytes)
+                    if editing || pe.projector_downloading == true {
+                        imagePEFile(L("修图视觉投影器", "Edit vision projector"), expectedSize: L("约 931 MB", "about 931 MB"),
+                                    cached: pe.projector_cached, downloading: pe.projector_downloading ?? pe.downloading,
+                                    bytes: pe.projector_bytes, total: pe.projector_total_bytes)
                     }
-                    if pe.downloading || vm.submittingImagePEDownload {
+                    if vm.submittingImagePEDownload && !pe.downloading {
                         HStack(spacing: 6) {
                             ProgressView().controlSize(.small)
-                            Text(pe.downloading
-                                 ? L("正在下载到 Colab…", "Downloading to Colab…")
-                                 : L("正在提交下载请求…", "Requesting the download…"))
+                            Text(L("正在提交下载请求…", "Requesting the download…"))
                         }
-                    } else if !pe.weights_cached || (editing && !pe.projector_cached) {
+                    } else if !pe.downloading && (!pe.weights_cached || (editing && !pe.projector_cached)) {
                         Button {
                             Task { await vm.downloadImagePEWeights() }
                         } label: {
@@ -1329,9 +1363,30 @@ extension MainStudioView {
         .foregroundStyle(.secondary)
     }
 
-    private func imagePEFile(_ name: String, cached: Bool) -> some View {
-        Label(name + " · " + (cached ? L("已缓存", "Cached") : L("待下载", "Download needed")),
-              systemImage: cached ? "checkmark.circle" : "arrow.down.circle")
+    @ViewBuilder
+    private func imagePEFile(_ name: String, expectedSize: String, cached: Bool, downloading: Bool,
+                             bytes: Int64?, total: Int64?) -> some View {
+        if downloading && !cached {
+            if let bytes, let total, total > 0, (0...total).contains(bytes) {
+                let fraction = Double(bytes) / Double(total)
+                HStack {
+                    Label(name, systemImage: "arrow.down.circle")
+                    Spacer()
+                    Text("\(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))")
+                    Text("\(Int(fraction * 100))%")
+                }
+                .monospacedDigit()
+                ProgressView(value: fraction).accessibilityLabel(name)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(name + " · " + L("正在下载", "Downloading"))
+                }
+            }
+        } else {
+            Label(name + " · " + expectedSize + " · " + (cached ? L("已缓存", "Cached") : L("待下载", "Download needed")),
+                  systemImage: cached ? "checkmark.circle" : "arrow.down.circle")
+        }
     }
 
     func promptEditor(
@@ -1370,6 +1425,9 @@ extension MainStudioView {
 
     var generateButtonTitle: String {
         let mod = vm.activeModelSpec.modality
+        if vm.isRequestingGenerationStop {
+            return L("正在请求停止推理…", "Requesting stop…")
+        }
         if vm.isGenerating {
             let liveTime = vm.currentJobElapsed > 0.05
                 ? L(" · 已耗时 \(formatDuration(vm.currentJobElapsed, compact: true))",
@@ -1434,7 +1492,7 @@ extension MainStudioView {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(vm.isGenerating || vm.waitingForEditReferences)
+                .disabled(vm.isGenerating || vm.isRequestingGenerationStop || vm.waitingForEditReferences)
                 .keyboardShortcut(.return, modifiers: [.command])
 
                 if vm.isGenerating {
@@ -1452,7 +1510,7 @@ extension MainStudioView {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
-                    .help(L("立即中断当前云端推理任务并解锁操作", "Abort the running cloud GPU job immediately"))
+                    .help(L("停止本次推理。要释放常驻模型的显存，请在左侧卸载模型。", "Stop this job. To free memory held by a loaded model, unload it in the sidebar."))
                 }
             }
 

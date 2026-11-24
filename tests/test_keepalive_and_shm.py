@@ -123,6 +123,11 @@ class SafeShmCgroupGuardTest(unittest.TestCase):
 
 
 class ColabBridgeKeepaliveTest(unittest.TestCase):
+    def setUp(self):
+        store = mock.patch.object(colab_bridge.state, "_store", mock.MagicMock())
+        store.start()
+        self.addCleanup(store.stop)
+
     def test_quiet_colab_cli_keeps_stdout_clean(self):
         fake_out = io.StringIO()
         fake_err = io.StringIO()
@@ -188,7 +193,7 @@ class ColabBridgeKeepaliveTest(unittest.TestCase):
             "m.patch('colab_bridge._has_valid_token', return_value=True).start();"
             "m.patch('colab_bridge._sync_and_adopt_sessions', return_value=({}, [])).start();"
             "info = type('I', (), {'paid_compute_units_balance': 100.0, 'consumption_rate_hourly': 0.0, 'assignments_count': 0})();"
-            "m.patch.object(colab_bridge.state, '_client', type('C', (), {'get_consumption_user_info': lambda self: info})());"
+            "m.patch.object(colab_bridge.state, '_client', type('C', (), {'get_consumption_user_info': lambda self: info})()).start();"
             "colab_bridge.cmd_keepalive_daemon()"
         )
         proc = subprocess.Popen(
@@ -228,6 +233,11 @@ def _fake_assignment(endpoint: str, accel, shape=None, token: str = "tok_x", url
 
 
 class HighTierAllocationReconciliationTest(unittest.TestCase):
+    def setUp(self):
+        store = mock.patch.object(colab_bridge.state, "_store", mock.MagicMock())
+        store.start()
+        self.addCleanup(store.stop)
+
     def test_allocate_recovers_background_g4_when_post_assign_times_out(self):
         import requests as req_pkg
         from colab_cli.client import Accelerator, Shape

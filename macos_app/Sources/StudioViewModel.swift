@@ -66,6 +66,7 @@ class StudioViewModel: ObservableObject {
             if Self.normalizeServerURL(oldValue) != Self.normalizeServerURL(colabServerURL) {
                 serverEditReferenceLimit = nil
                 imagePEStatus = nil
+                imagePEJobID = nil
                 submittingImagePEDownload = false
                 adminPassword = Self.savedAdminPassword(for: colabServerURL)
                 remoteApiKeySynced = false
@@ -147,6 +148,10 @@ class StudioViewModel: ObservableObject {
     @Published var isWakingColab: Bool = false {
         didSet { syncMacOSRuntimeActivityAssertion() }
     }
+    @Published var useDriveWeights = UserDefaults.standard.object(forKey: "useDriveWeights") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(useDriveWeights, forKey: "useDriveWeights") }
+    }
+    @Published var wakeDriveConsentURL: URL?
 
     // 远端 GPU 与多模型驻留状态
     @Published var isConnected: Bool = false {
@@ -278,6 +283,14 @@ class StudioViewModel: ObservableObject {
     @Published var taskModeId: String = "t2va"
     @Published var visualPrompt: String = PRESET_TEMPLATES[0].visual
     @Published var enhanceImagePrompt = false
+    @Published private(set) var expandedImagePrompt: String?
+    @Published private(set) var imagePEJobProgress: ImagePEJobProgress?
+    private var imagePEJobID: String? {
+        didSet {
+            expandedImagePrompt = nil
+            imagePEJobProgress = nil
+        }
+    }
     @Published var imagePEStatus: ImagePEStatus?
     @Published var submittingImagePEDownload = false
     @Published var negativePrompt: String = ""
@@ -366,8 +379,12 @@ class StudioViewModel: ObservableObject {
 
     // 任务进度与生成耗时状态
     @Published var isGenerating: Bool = false {
-        didSet { syncMacOSRuntimeActivityAssertion() }
+        didSet {
+            if !isGenerating { imagePEJobProgress = nil }
+            syncMacOSRuntimeActivityAssertion()
+        }
     }
+    @Published private(set) var isRequestingGenerationStop = false
     @Published var progressValue: Double = 0.0
     @Published var currentJobElapsed: Double = 0.0
     @Published var lastCompletedElapsed: Double? = nil
@@ -448,6 +465,7 @@ class StudioViewModel: ObservableObject {
     // macOS 防 App Nap 休眠断言与常驻外部 Runtime Proxy 保活守护进程状态
     var runtimeActivityToken: NSObjectProtocol? = nil
     var activeWakeProcess: Process? = nil
+    var wakeInputPipe: Pipe?
     var wakeObtainedURLThisRun: Bool = false
     var keepaliveDaemonProcess: Process? = nil
     var keepaliveDaemonStdinPipe: Pipe? = nil
@@ -777,6 +795,7 @@ class StudioViewModel: ObservableObject {
     func switchSelectedModel(_ spec: OpenModelSpec) {
         guard selectedModelId != spec.id else { return }
         selectedModelId = spec.id
+        imagePEJobID = nil
         serverEditReferenceLimit = nil
         taskModeId = spec.modes[0].id
         inferenceSteps = spec.defaultSteps
@@ -1255,7 +1274,19 @@ class StudioViewModel: ObservableObject {
         }
     }
 
+    private func updateImagePE(from job: ColabJobResponse) {
+        guard job.job_id == imagePEJobID else { return }
+        let progress = isGenerating ? ImagePEJobProgress(job) : nil
+        if progress != imagePEJobProgress { imagePEJobProgress = progress }
+        if let prompt = job.expanded_prompt, !prompt.isEmpty, prompt != expandedImagePrompt {
+            expandedImagePrompt = prompt
+        }
+    }
+
     func cancelCurrentGeneration() async {
+        guard isGenerating, !isRequestingGenerationStop else { return }
+        isRequestingGenerationStop = true
+        defer { isRequestingGenerationStop = false }
         activeGenerationToken = UUID()
         stopLiveGenerationTimer()
         isGenerating = false
@@ -1274,15 +1305,21 @@ class StudioViewModel: ObservableObject {
             req.httpMethod = "POST"
             req.timeoutInterval = 12
             let (data, resp) = try await adminSession.data(for: req)
-            if (resp as? HTTPURLResponse)?.statusCode == 200,
-               let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            guard normalizedBaseURL == base else { return }
+            if let decoded = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
                 applyStatusResponse(decoded)
             }
             stripConsoleProgressBars()
             statusMessage = L(
-                "已停止当前推理任务，GPU 已恢复就绪。",
-                "Stopped current inference task. GPU is ready."
+                "云端已收到停止请求。常驻模型可在左侧卸载。",
+                "The server received the stop request. You can unload resident models in the sidebar."
             )
+            // PE may finish between the last poll and the worker acknowledging cancellation.
+            if expandedImagePrompt == nil, let jobID = imagePEJobID {
+                let stopToken = activeGenerationToken
+                Task { await fetchStoppedImagePrompt(base: base, jobID: jobID, token: stopToken) }
+            }
         } catch {
             statusMessage = L(
                 "本地已停止；远端连接异常: \(error.localizedDescription)",
@@ -1291,7 +1328,24 @@ class StudioViewModel: ObservableObject {
         }
     }
 
+    private func fetchStoppedImagePrompt(base: String, jobID: String, token: UUID) async {
+        guard let url = URL(string: "\(base)/minimax_api/job/\(jobID)"),
+              var request = try? adminRequest(url) else { return }
+        request.timeoutInterval = 5
+        for _ in 0..<5 {
+            guard activeGenerationToken == token, imagePEJobID == jobID,
+                  let (data, response) = try? await adminSession.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let job = try? JSONDecoder().decode(ColabJobResponse.self, from: data),
+                  activeGenerationToken == token, imagePEJobID == jobID else { return }
+            updateImagePE(from: job)
+            guard expandedImagePrompt == nil, job.status == "queued" || job.status == "running" else { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
     func startGeneration() async {
+        guard !isGenerating, !isRequestingGenerationStop else { return }
         let promptTrimmed = visualPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !promptTrimmed.isEmpty else {
             statusMessage = activeModelSpec.modality == .llmVLM
@@ -1315,6 +1369,7 @@ class StudioViewModel: ObservableObject {
             return
         }
         await checkColabStatus(silent: true)
+        guard !isGenerating, !isRequestingGenerationStop else { return }
         guard isConnected else {
             statusMessage = L(
                 "尚未连接 Colab 服务端，请先唤醒或连接现有实例。",
@@ -1356,7 +1411,10 @@ class StudioViewModel: ObservableObject {
         guard let submitURL = URL(string: "\(base)/minimax_api/generate") else { return }
 
         let myToken = UUID()
+        let submittedModelID = selectedModelId
+        let useImagePE = activeModelSpec.modality == .image && enhanceImagePrompt
         activeGenerationToken = myToken
+        imagePEJobID = nil
         isGenerating = true
         progressValue = 0.0
         currentJobElapsed = 0.0
@@ -1391,7 +1449,7 @@ class StudioViewModel: ObservableObject {
             req.timeoutInterval = 30
 
             var payload: [String: Any] = [
-                "model_id": selectedModelId,
+                "model_id": submittedModelID,
                 "task_mode": taskModeId,
                 "visual_prompt": promptTrimmed,
                 "negative_prompt": negativePrompt,
@@ -1417,7 +1475,7 @@ class StudioViewModel: ObservableObject {
                 "repeat_penalty": 1.0,
                 "reasoning_effort": reasoningEffort
             ]
-            if activeModelSpec.modality == .image && enhanceImagePrompt {
+            if useImagePE {
                 payload["enhance_prompt"] = true
             }
             if !chatPayload.isEmpty {
@@ -1452,6 +1510,10 @@ class StudioViewModel: ObservableObject {
             let (data, _) = try await adminSession.data(for: req)
             guard activeGenerationToken == myToken else { return }
             let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
+            if useImagePE && selectedModelId == submittedModelID && normalizedBaseURL == base {
+                imagePEJobID = job.job_id
+                updateImagePE(from: job)
+            }
 
             if job.status == "failed" {
                 stopLiveGenerationTimer()
@@ -1533,6 +1595,7 @@ class StudioViewModel: ObservableObject {
                 }
                 consecutivePollErrors = 0
                 let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
+                updateImagePE(from: job)
                 if let tl = job.telemetry {
                     applyLiveTelemetrySnapshot(tl)
                 }

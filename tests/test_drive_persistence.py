@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -54,6 +55,90 @@ def _load_app_drive_helpers(tmp_root: str):
 
 
 class ColabBridgeDriveMountTest(unittest.TestCase):
+    def test_native_wake_waits_for_consent_and_requires_a_real_mount(self):
+        # Exercise the actual detached stdin / stdout boundary, using a fake
+        # Colab kernel and filesystem for each case.
+        worker = """
+import contextlib, io, os, sys, types
+from unittest.mock import Mock, patch
+import colab_bridge as bridge
+from colab_cli.commands import automation
+
+mode = sys.argv[1]
+session = types.SimpleNamespace(endpoint="test-vm", url="unused", token="unused", kernel_id="k", session_id="s")
+bridge.state.get_session = lambda name: session
+bridge.state._store = Mock()
+bridge.ColabRuntime = Mock()
+drive = types.ModuleType("google.colab.drive")
+colab = types.ModuleType("google.colab")
+colab.drive = drive
+sys.modules["google.colab"] = colab
+mounted = mode == "existing"
+
+def mount(path):
+    global mounted
+    assert path == "/content/drive"
+    assert mode != "existing"
+    uri = "https://accounts.google.com/o/oauth2/v2/auth?state=test"
+    if mode == "bad-link":
+        uri = "https://example.org/o/oauth2/v2/auth?state=test"
+    bridge.state.history.log_event("test", "drive_auth_needed", {"uri": uri})
+    assert sys.stdin.readline() == "\\n"
+    mounted = mode != "plain-directory"
+
+def fake_automation(name, op, code, **kwargs):
+    assert name == "test" and op == "drivemount" and kwargs["allow_stdin"]
+    print("private CLI output", flush=True)
+    outputs = io.StringIO()
+    def stat(path):
+        return types.SimpleNamespace(st_dev=2 if mounted and path.endswith("MyDrive") else 1)
+    with patch.object(os.path, "isdir", return_value=True), patch.object(os, "stat", stat), contextlib.redirect_stdout(outputs):
+        exec(code, {})
+    bridge.state.history.log_event("test", "automation_result", {"outputs": [{"text": outputs.getvalue()}]})
+
+drive.mount = mount
+automation.run_automation = fake_automation
+sys.exit(bridge._native_drive_worker("test", "test-vm"))
+"""
+        cases = [
+            ("existing", "", 0, False),
+            ("new", "DRIVE_GRANTED\n", 0, True),
+            ("new", "", 2, True),
+            ("new", "\n", 2, True),
+            ("bad-link", "DRIVE_GRANTED\n", 2, False),
+            ("plain-directory", "DRIVE_GRANTED\n", 1, True),
+        ]
+        for mode, response, status, requested in cases:
+            with self.subTest(mode=mode, response=response):
+                result = subprocess.run(
+                    [sys.executable, "-c", worker, mode], cwd=REPO_ROOT, input=response,
+                    capture_output=True, text=True, timeout=20, start_new_session=True,
+                )
+                self.assertEqual(result.returncode, status)
+                self.assertEqual(result.stderr, "")
+                expected = "WAKE_DRIVE_AUTH:https://accounts.google.com/o/oauth2/v2/auth?state=test\n"
+                self.assertEqual(result.stdout, expected if requested else "")
+
+    def test_wake_requires_drive_only_when_requested(self):
+        for flag in ([], ["--require-drive"]):
+            with self.subTest(flag=flag), mock.patch.object(colab_bridge, "cmd_wake") as wake:
+                colab_bridge.main(["wake", "--app-py", "app.py", *flag])
+                wake.assert_called_once_with("G4", "app.py", require_drive=bool(flag))
+
+    def test_failed_drive_mount_stops_deployment_before_upload(self):
+        session = mock.Mock()
+        with mock.patch.dict(os.environ, {"EASYCOLAB_ADMIN_PASSWORD": "test-only"}), \
+             mock.patch.object(colab_bridge, "_has_valid_token", return_value=True), \
+             mock.patch.object(colab_bridge, "_safe_sync_sessions", return_value=({}, [])), \
+             mock.patch.object(colab_bridge, "_allocate_fresh_session", return_value=session), \
+             mock.patch.object(colab_bridge, "_wait_for_runtime_ready", return_value=True), \
+             mock.patch.object(colab_bridge, "_ensure_wake_drive", side_effect=RuntimeError("mount failed")) as mount, \
+             mock.patch.object(colab_bridge, "ContentsClient") as contents, redirect_stdout(io.StringIO()) as output:
+            colab_bridge.cmd_wake("G4", APP_PY_PATH, require_drive=True)
+        mount.assert_called_once_with(session)
+        contents.assert_not_called()
+        self.assertIn("WAKE_ERROR: mount failed", output.getvalue())
+
     def test_build_rclone_conf_rejects_public_adc_without_quota_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             tok_file = os.path.join(tmp, "token.json")

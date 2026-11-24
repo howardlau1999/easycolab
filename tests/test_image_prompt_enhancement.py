@@ -4,14 +4,18 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import contextlib
+import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import weakref
 from concurrent.futures import Future
 from contextlib import ExitStack, nullcontext
 from datetime import datetime
@@ -43,15 +47,21 @@ class ImagePromptEnhancementTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app_code = load_app_code(
-            "GenerateVideoRequest", "_run_async_generation_job", "openai_images_generations", "_generate_gateway_images",
+            "GenerateVideoRequest", "_run_async_generation_job", "_execute_generation_job", "openai_images_generations", "_generate_gateway_images",
             "_edit_reference_sources", "_decode_edit_references", "EDIT_REFERENCE_LIMITS", "api_generate",
+            "api_cancel_generation",
         )
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.lock = threading.Lock()
-        self.expand = Mock(return_value=EXPANDED)
+        def expand(_prompt, *, on_expanded=None, **kwargs):
+            if on_expanded:
+                on_expanded(EXPANDED)
+            return EXPANDED
+
+        self.expand = Mock(side_effect=expand)
         image = Mock()
         image.save.side_effect = self.save_image
         self.generate = Mock(return_value=image)
@@ -113,6 +123,7 @@ class ImagePromptEnhancementTest(unittest.TestCase):
         self.assertEqual(self.job["status"], "completed", self.job["message"])
         self.expand.assert_called_once_with(
             ORIGINAL, images=refs, width=SIZE[0], height=SIZE[1], seed=73, cancel_event=ANY, on_stage=ANY,
+            on_expanded=ANY, on_progress=ANY,
         )
         self.assertEqual(self.job["expanded_prompt"], EXPANDED)
         self.assertEqual(self.job["completed_count"], 2)
@@ -128,6 +139,34 @@ class ImagePromptEnhancementTest(unittest.TestCase):
         self.run_job(task_mode="i2i_edit", first_frame_base64="first", last_frame_base64="last")
         self.assertEqual(self.generate.call_args.kwargs["edit_image"], ["first", "last"])
         self.expand.assert_not_called()
+
+    def test_cancel_retains_prompt_and_reclaims_after_inference_frame_is_gone(self):
+        class Transient:
+            pass
+
+        refs = []
+        self.env.update(SELECTED_MODEL_ID=self.engine, get_gpu_status_dict=Mock(return_value={}))
+
+        def sample(**kwargs):
+            activation = Transient()
+            refs.append(weakref.ref(activation))
+            self.assertEqual(self.job["expanded_prompt"], EXPANDED)
+            self.env["api_cancel_generation"]()
+            self.assertEqual(self.job["status"], "running")
+            raise self.env["GenerationAbortedError"]("cancelled")
+
+        def reclaim(*, trim_cpu=False):
+            if trim_cpu:
+                self.assertIsNone(refs[0]())
+                self.assertEqual(self.job["status"], "running")
+
+        self.generate.side_effect = sample
+        self.env["_reclaim_transient_gpu_memory"].side_effect = reclaim
+        self.run_job(task_mode="t2i", enhance_prompt=True)
+        self.assertEqual(self.job["status"], "failed")
+        self.assertEqual(self.job["expanded_prompt"], EXPANDED)
+        self.env["_reclaim_transient_gpu_memory"].assert_called_with(trim_cpu=True)
+        self.assertFalse(self.env["_JOB_CANCEL_EVENTS"])
 
     def test_api_rejects_overflow_before_superseding_an_active_job(self):
         class HTTPError(Exception):
@@ -169,13 +208,20 @@ class ImagePromptEnhancementTest(unittest.TestCase):
                 self.generate.assert_not_called()
 
     def test_job_failure_before_sampling_releases_gpu(self):
-        self.expand.side_effect = RuntimeError("expansion failed")
+        def fail(_prompt, *, on_progress, **kwargs):
+            on_progress("loading", 0.54)
+            self.assertEqual((self.job["pe_stage"], self.job["pe_progress"]), ("loading", 0.54))
+            raise RuntimeError("expansion failed")
+
+        self.expand.side_effect = fail
         self.run_job(task_mode="t2i", enhance_prompt=True)
         self.assertEqual(self.job["status"], "failed")
         self.assertIn("expansion failed", self.job["message"])
         self.generate.assert_not_called()
         self.assertFalse(self.lock.locked())
         self.assertFalse(self.env["_JOB_CANCEL_EVENTS"])
+        self.assertNotIn("pe_progress", self.job)
+        self.assertNotIn("pe_stage", self.job)
 
     def test_gateway_batch_returns_the_prompt_used_for_each_image(self):
         response = self.request_images(enhance_prompt=True, n=2)
@@ -205,7 +251,10 @@ class ImagePromptEnhancementTest(unittest.TestCase):
 class PromptExpansionBackendTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app_code = load_app_code("_build_image_pe_request", "_request_image_pe_caption", "expand_image_prompt")
+        cls.app_code = load_app_code(
+            "_build_image_pe_request", "_image_pe_prompt_directory", "IMAGE_PE_TEMPLATE_BLOBS",
+            "IMAGE_PE_TEMPLATE_REVISION", "_request_image_pe_caption", "expand_image_prompt",
+        )
 
     def setUp(self):
         self.stack = ExitStack()
@@ -227,13 +276,30 @@ class PromptExpansionBackendTest(unittest.TestCase):
         (templates / "t2i/request_params.json").write_text('{"response_format":{"json_schema":{}}}')
         self.env = {
             "json": json, "os": os, "threading": threading, "MODEL_BASE_ROOT": root,
+            "DRIVE_MOUNTED": False,
             "MINIMAX_IMAGE_PE_REPO": "MiniMaxAI/MiniMax-H3-Image-PE", "_pil_to_jpeg_data_url": lambda im: im.url,
             "torch": Mock(), "_start_qwen_gguf_server": Mock(return_value={"base_url": "http://localhost:30000"}),
             "_queue_image_pe_weights": Mock(return_value=(["test.gguf"], [])),
             "_stop_gguf_server_bundle": Mock(), "_reclaim_transient_gpu_memory": Mock(),
+            "GenerationAbortedError": type("GenerationAbortedError", (RuntimeError,), {}),
         }
         self.env["torch"].cuda.mem_get_info.return_value = (20 * 1024**3, 24 * 1024**3)
         exec(self.app_code, self.env)
+
+    def test_pinned_prompt_templates_are_reused_from_drive(self):
+        self.env.update(DRIVE_MOUNTED=True, LEGACY_DRIVE_MODEL_ROOTS=[self.env["MODEL_BASE_ROOT"]])
+        source = Path(self.env["MODEL_BASE_ROOT"]) / "prompt"
+        cached = Path(self.env["MODEL_BASE_ROOT"]) / self.env["MINIMAX_IMAGE_PE_REPO"] / "prompt"
+        cached.parent.mkdir(parents=True)
+        source.rename(cached)
+        for name in self.env["IMAGE_PE_TEMPLATE_BLOBS"]:
+            data = (cached / name).read_bytes()
+            self.env["IMAGE_PE_TEMPLATE_BLOBS"][name] = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+        self.assertEqual(self.env["_image_pe_prompt_directory"](), cached)
+        self.hub.snapshot_download.assert_not_called()
+        (cached / "edit/task_prompt.txt").write_text("stale revision")
+        self.env["_image_pe_prompt_directory"]()
+        self.hub.snapshot_download.assert_called_once()
 
     def test_remote_edit_uses_ordered_images_and_only_returns_caption(self):
         self.stack.enter_context(patch.dict(os.environ, EASYCOLAB_IMAGE_PE_BASE_URL="http://remote.test/v1"))
@@ -264,8 +330,21 @@ class PromptExpansionBackendTest(unittest.TestCase):
         content = json.dumps({"expanded_caption": EXPANDED})
         self.post.return_value.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
         refs = [SimpleNamespace(size=(1000, 1000), url=f"image-{i}") for i in range(16)]
-        result = self.env["expand_image_prompt"](ORIGINAL, images=refs, width=SIZE[0], height=SIZE[1], seed=17)
+        received = []
+        progress = []
+        self.env["_stop_gguf_server_bundle"].side_effect = lambda _: self.assertEqual(received, [EXPANDED])
+        def load(*args, on_load_progress, **kwargs):
+            on_load_progress(0.64)
+            on_load_progress(1.0)
+            return {"base_url": "http://localhost:30000"}
+
+        self.env["_start_qwen_gguf_server"].side_effect = load
+        result = self.env["expand_image_prompt"](
+            ORIGINAL, images=refs, width=SIZE[0], height=SIZE[1], seed=17, on_expanded=received.append,
+            on_progress=lambda stage, value: progress.append((stage, value)),
+        )
         self.assertEqual(result, EXPANDED)
+        self.assertEqual(progress, [("loading", None), ("loading", 0.64), ("loading", 1.0), ("expanding", None)])
         start = self.env["_start_qwen_gguf_server"].call_args
         self.assertEqual(start.args[1], "projector.gguf")
         self.assertEqual(start.kwargs["image_max_tokens"], 1024)
@@ -291,13 +370,134 @@ class PromptExpansionBackendTest(unittest.TestCase):
                     {"role": "system", "content": "System"}, {"role": "user", "content": f"Expand {ORIGINAL}"},
                 ])
 
+    def test_stopping_pending_shared_download_does_not_start_local_server(self):
+        self.stack.enter_context(patch.dict(os.environ, EASYCOLAB_IMAGE_PE_BASE_URL=""))
+        transfer = Future()
+        self.env["_queue_image_pe_weights"].return_value = (["test.gguf"], [transfer])
+        cancelled = threading.Event()
+        with self.assertRaises(self.env["GenerationAbortedError"]):
+            self.env["expand_image_prompt"](
+                ORIGINAL, images=[], width=640, height=640, seed=42,
+                cancel_event=cancelled, on_stage=lambda _: cancelled.set(),
+            )
+        self.assertFalse(transfer.done())
+        self.env["_start_qwen_gguf_server"].assert_not_called()
+
+    def test_stopping_caption_request_tears_down_both_http_and_local_server(self):
+        self.stack.enter_context(patch.dict(os.environ, EASYCOLAB_IMAGE_PE_BASE_URL=""))
+        cancelled = threading.Event()
+        request_closed = threading.Event()
+
+        async def pending(*args, **kwargs):
+            cancelled.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                request_closed.set()
+
+        self.post.side_effect = pending
+        callback = Mock()
+        with self.assertRaises(self.env["GenerationAbortedError"]):
+            self.env["expand_image_prompt"](
+                ORIGINAL, images=[], width=640, height=640, seed=42,
+                cancel_event=cancelled, on_expanded=callback,
+            )
+        self.assertTrue(request_closed.is_set())
+        callback.assert_not_called()
+        self.env["_stop_gguf_server_bundle"].assert_called_once_with(self.env["_start_qwen_gguf_server"].return_value)
+
+
+class ImageJobResourceLifecycleTest(unittest.TestCase):
+    def test_stopping_while_another_job_installs_the_engine_releases_only_the_waiter(self):
+        lock = threading.Lock()
+        cancelled = threading.Event()
+        cancelled.set()
+        env = {
+            "_LLAMA_SERVER_INSTALL_LOCK": lock, "_install_or_reuse_llama_server": Mock(),
+            "GenerationAbortedError": type("GenerationAbortedError", (RuntimeError,), {}),
+        }
+        exec(load_app_code("_ensure_llama_server_binary"), env)
+        with lock:
+            with self.assertRaises(env["GenerationAbortedError"]):
+                env["_ensure_llama_server_binary"](cancel_event=cancelled)
+            self.assertTrue(lock.locked())
+        env["_install_or_reuse_llama_server"].assert_not_called()
+
+    def test_modular_pipeline_stops_at_block_and_restores_its_managed_cuda_component(self):
+        class Module:
+            def register_forward_pre_hook(self, hook, **kwargs):
+                self.abort_hook = hook
+                return self.handle
+
+        transformer = Module()
+        block = Module()
+        transformer.handle = Mock()
+        block.handle = Mock()
+        transformer.named_modules = lambda: [("layers", [block])]
+        transformer.device = SimpleNamespace(type="cuda")
+        managed = Mock(model=transformer)
+        unrelated = Mock()
+        pipe = SimpleNamespace(
+            components={"transformer": transformer},
+            _components_manager=SimpleNamespace(model_hooks=[managed, unrelated]),
+        )
+        cancelled = threading.Event()
+        env = {
+            "torch": SimpleNamespace(nn=SimpleNamespace(Module=Module, ModuleList=list)),
+            "threading": threading, "ABORT_GENERATION_EVENT": threading.Event(),
+            "GenerationAbortedError": type("GenerationAbortedError", (RuntimeError,), {}),
+        }
+        exec(load_app_code("_pipeline_job_execution_guard"), env)
+        guard = contextlib.contextmanager(env["_pipeline_job_execution_guard"])
+        with self.assertRaises(env["GenerationAbortedError"]):
+            with guard(pipe, "test", cancelled, time.time(), 0, 1, "", "MiniMax", "image"):
+                cancelled.set()
+                block.abort_hook(block, ())
+        managed.offload.assert_called_once_with()
+        unrelated.offload.assert_not_called()
+        block.handle.remove.assert_called_once_with()
+        transformer.handle.remove.assert_called_once_with()
+
+    def test_startup_exception_reaps_the_temporary_server(self):
+        # Fail after Popen but before the first successful health check. A real child verifies wait/reap.
+        procs = []
+
+        def spawn(_cmd, **kwargs):
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+            procs.append(proc)
+            return proc
+
+        thread = Mock()
+        thread.start.side_effect = RuntimeError("cannot start output reader")
+        env = {
+            "os": os, "time": time, "threading": SimpleNamespace(Thread=Mock(return_value=thread)),
+            "contextlib": contextlib,
+            "subprocess": SimpleNamespace(Popen=spawn, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT,
+                                          TimeoutExpired=subprocess.TimeoutExpired),
+            "_ensure_llama_server_binary": Mock(return_value=(sys.executable, os.environ.copy())),
+            "_make_noproxy_opener": Mock(), "_pick_free_local_port": Mock(return_value=18080),
+        }
+        exec(load_app_code("_start_qwen_gguf_server", "_stop_gguf_server_bundle"), env)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "output reader"):
+                env["_start_qwen_gguf_server"]("test.gguf", None, 32768, 64, for_prompt_expansion=True)
+            self.assertEqual(len(procs), 1)
+            self.assertIsNotNone(procs[0].returncode)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
+
 
 class ImagePEWeightDownloadTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app_code = load_app_code(
             "_queue_image_pe_weights", "_download_image_pe_file", "_get_image_pe_status",
-            "_image_pe_file_cached", "DownloadImagePERequest", "api_download_image_pe",
+            "_image_pe_weight_path", "_image_pe_file_cached", "_image_pe_progress_bar", "_image_pe_download_fraction",
+            "DownloadImagePERequest", "api_download_image_pe",
         )
 
     def setUp(self):
@@ -312,6 +512,8 @@ class ImagePEWeightDownloadTest(unittest.TestCase):
             "IMAGE_PE_WEIGHT": "weights", "IMAGE_PE_PROJECTOR": "projector", "IMAGE_PE_FILE_SIZES": {"weights": 7, "projector": 7},
             "MODEL_BASE_ROOT": str(self.root), "IMAGE_PE_GGUF_REPO": "pe", "IMAGE_PE_GGUF_REVISION": "revision",
             "_IMAGE_PE_DOWNLOAD_LOCK": threading.Lock(), "_IMAGE_PE_DOWNLOADS": {}, "_IMAGE_PE_ERRORS": {},
+            "_IMAGE_PE_DOWNLOAD_BYTES": {},
+            "DRIVE_MOUNTED": False,
             "_refresh_drive_mount_state": Mock(), "touch_activity": Mock(), "SELECTED_MODEL_ID": "generator",
             "get_gpu_status_dict": lambda **kw: {"image_pe": self.env["_get_image_pe_status"]()},
         }
@@ -362,6 +564,39 @@ class ImagePEWeightDownloadTest(unittest.TestCase):
         with patch.dict(os.environ, EASYCOLAB_IMAGE_PE_BASE_URL="http://pe.test/v1"):
             self.assertEqual(self.download(True)["mode"], "remote")
         self.assertEqual(self.hub.hf_hub_download.call_count, 2)
+
+    def test_native_mount_reuses_weights_saved_in_older_rclone_root(self):
+        old_root = self.root / "EasyColab_Drive" / "EasyColab_Models"
+        self.env.update(DRIVE_MOUNTED=True, LEGACY_DRIVE_MODEL_ROOTS=[str(old_root)])
+        for root, name in ((old_root, "weights"), (self.root, "projector")):
+            (root / "pe").mkdir(parents=True)
+            (root / "pe" / name).write_bytes(b"weights")
+        paths, pending = self.env["_queue_image_pe_weights"](True)
+        self.assertEqual(paths, [str(old_root / "pe" / "weights"), str(self.root / "pe" / "projector")])
+        self.assertEqual(pending, [])
+        self.assertTrue(self.env["_get_image_pe_status"]()["weights_cached"])
+        self.hub.hf_hub_download.assert_not_called()
+
+    def test_download_bytes_follow_file_reconstruction_and_cached_dependencies(self):
+        class BaseBar:
+            def __init__(self, initial=0, **kwargs):
+                self.n = initial
+
+        path = str(self.root / "pe" / "weights")
+        projector = self.root / "pe" / "projector"
+        projector.parent.mkdir()
+        projector.write_bytes(b"weights")
+        get_status = self.env["_get_image_pe_status"]
+        with patch.dict(sys.modules, {"tqdm.auto": SimpleNamespace(tqdm=BaseBar)}):
+            bar = self.env["_image_pe_progress_bar"](path)
+            file_bar = bar(initial=2, total=7)
+            self.assertEqual(get_status()["weights_bytes"], 2)
+            wire_bar = bar(name="huggingface_hub.xet_get.transfer", total=7)
+            wire_bar.update(6)
+            file_bar.update(1)
+        self.assertEqual(get_status()["weights_bytes"], 3)
+        self.assertEqual(get_status()["projector_bytes"], get_status()["projector_total_bytes"])
+        self.assertAlmostEqual(self.env["_image_pe_download_fraction"]([path, str(projector)]), 10 / 14)
 
 
 if __name__ == "__main__":

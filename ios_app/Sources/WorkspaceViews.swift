@@ -507,6 +507,23 @@ struct CreateTabView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     }
+                    if let prompt = vm.expandedImagePrompt {
+                        DisclosureGroup(L("PE 增强后的提示词", "Expanded prompt")) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(verbatim: prompt)
+                                    .font(.subheadline)
+                                    .textSelection(.enabled)
+                                Button {
+                                    UIPasteboard.general.string = prompt
+                                    vm.showToast(L("已复制提示词", "Prompt copied"))
+                                } label: {
+                                    Label(L("复制提示词", "Copy prompt"), systemImage: "doc.on.doc")
+                                }
+                                .font(.caption)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                 }
 
                 // Stereo Audio Prompts for MiniMax-H3
@@ -686,10 +703,13 @@ struct CreateTabView: View {
     private var generateActionCard: some View {
         VStack(spacing: 10) {
             if vm.isGenerating {
+                let stage = vm.peStageLabel
+                let progress = stage == nil ? vm.progressValue : vm.peProgress
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         ProgressView().scaleEffect(0.85)
-                        Text(String(format: "%.0f%% · %@", vm.progressValue * 100, formatDuration(vm.currentJobElapsed, compact: true)))
+                        Text([stage, progress.map { String(format: "%.0f%%", $0 * 100) }, formatDuration(vm.currentJobElapsed, compact: true)]
+                            .compactMap { $0 }.joined(separator: " · "))
                             .font(.caption.monospacedDigit().weight(.bold))
                             .foregroundColor(.accentColor)
                         Spacer()
@@ -703,7 +723,8 @@ struct CreateTabView: View {
                         .tint(.red)
                         .controlSize(.small)
                     }
-                    ProgressView(value: vm.progressValue)
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
                         .tint(.accentColor)
                     Text(vm.statusMessage)
                         .font(.caption2)

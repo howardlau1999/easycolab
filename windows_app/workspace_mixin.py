@@ -873,6 +873,16 @@ class WorkspaceMixin:
         enhance_prompt.toggled.connect(pe_details.setVisible)
         p_card.body.addWidget(pe_details)
 
+        self.img_expanded_box = CollapsibleBox(tr("PE 增强后的提示词", "Expanded prompt"), expanded=True)
+        self.img_expanded_text = QPlainTextEdit()
+        self.img_expanded_text.setReadOnly(True)
+        self.img_expanded_text.setFixedHeight(104)
+        self.img_expanded_box.content_layout.addWidget(self.img_expanded_text)
+        copy_prompt = QPushButton(tr("复制提示词", "Copy prompt"))
+        copy_prompt.clicked.connect(lambda: self._copy_text(self.vm.expanded_image_prompt, tr("已复制提示词", "Prompt copied")))
+        self.img_expanded_box.content_layout.addWidget(copy_prompt, alignment=Qt.AlignmentFlag.AlignRight)
+        p_card.body.addWidget(self.img_expanded_box)
+
         p_card.body.addWidget(
             QLabel(
                 tr(

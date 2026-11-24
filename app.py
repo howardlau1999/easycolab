@@ -1134,19 +1134,21 @@ def _is_llm_model_id(model_id: Optional[str]) -> bool:
 def _stop_gguf_server_bundle(bundle: Optional[Dict[str, Any]]):
     if not bundle or bundle.get("backend") != "gguf":
         return
-    proc = bundle.pop("server_proc", None)
+    proc = bundle.get("server_proc")
     if proc is not None:
         try:
+            if proc.stdin is not None:
+                proc.stdin.close()
             if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=5.0)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=2.0)
-        except Exception:
-            pass
-        time.sleep(0.25)
+                    proc.wait()
+        except ProcessLookupError:
+            proc.wait()
+        bundle.pop("server_proc", None)
 
 
 def _cleanup_all_gguf_servers():
@@ -1352,6 +1354,7 @@ MODEL_BASE_ROOT = (
 )
 LEGACY_DRIVE_MODEL_ROOT = "/content/drive/MyDrive/MiniMax_H3_Models"
 LEGACY_DRIVE_MODEL_ROOTS = [
+    "/content/drive/MyDrive/EasyColab_Drive/EasyColab_Models",
     "/content/drive/MyDrive/Aevix_Models",
     "/content/drive/MyDrive/MiniMax_H3_Models",
 ]
@@ -1476,6 +1479,14 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
 MINIMAX_H3_IMAGE_FILES = list(MODEL_CATALOG["minimax_h3_image"]["files"])
 EDIT_REFERENCE_LIMITS = {"minimax_h3_image": 16, "qwen_image_21": 10, "z_image_turbo": 1}
 MINIMAX_IMAGE_PE_REPO = "MiniMaxAI/MiniMax-H3-Image-PE"
+IMAGE_PE_TEMPLATE_REVISION = "35603d4b63949afa12cb098227fffefedf081afa"
+# Git blob IDs from the pinned prompt templates, shared by the local and Drive caches.
+IMAGE_PE_TEMPLATE_BLOBS = {
+    "t2i/request_params.json": "07f9daf839730cd747190b65546226f63e7736b4",
+    "t2i/system_prompt.txt": "507dbb93119380808d7a94b1a4e31239c89c766d",
+    "t2i/task_prompt.txt": "30da92f09c438e55459b303fa6c755515ee79592",
+    "edit/task_prompt.txt": "d2d6df7b5cc543a172e0aa69840f5168e3c70295",
+}
 IMAGE_PE_GGUF_REPO = "prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF"
 IMAGE_PE_GGUF_REVISION = "fce97403ab2a34b62317bd7b37f380fecaef2565"
 IMAGE_PE_WEIGHT = "MiniMax-H3-Image-PE-NVFP4.gguf"
@@ -1483,6 +1494,7 @@ IMAGE_PE_PROJECTOR = "MiniMax-H3-Image-PE.mmproj.gguf"
 IMAGE_PE_FILE_SIZES = {IMAGE_PE_WEIGHT: 17_010_708_032, IMAGE_PE_PROJECTOR: 931_146_464}
 _IMAGE_PE_DOWNLOAD_LOCK = threading.Lock()
 _IMAGE_PE_DOWNLOADS: Dict[str, Future] = {}
+_IMAGE_PE_DOWNLOAD_BYTES: Dict[str, int] = {}
 _IMAGE_PE_ERRORS: Dict[str, str] = {}
 BUILTIN_MODEL_IDS = set(MODEL_CATALOG.keys())
 CUSTOM_MODELS_LOCK = threading.Lock()
@@ -3828,8 +3840,14 @@ def prepare_minimax_h3_image_assembled_dir(
         return all(os.path.exists(os.path.join(base_d, m)) for m in MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS)
 
     if not _configs_complete(assembled_dir):
-        if DRIVE_MOUNTED and _configs_complete(drive_cfg_cache):
-            shutil.copytree(drive_cfg_cache, assembled_dir, dirs_exist_ok=True)
+        if DRIVE_MOUNTED:
+            caches = [drive_cfg_cache] + [
+                os.path.join(root, repo_id, "_modular_configs") for root in LEGACY_DRIVE_MODEL_ROOTS
+            ]
+            for cache in caches:
+                if _configs_complete(cache):
+                    shutil.copytree(cache, assembled_dir, dirs_exist_ok=True)
+                    break
         if not _configs_complete(assembled_dir):
             from huggingface_hub import snapshot_download
 
@@ -3999,6 +4017,8 @@ def load_minimax_h3_image_pipeline(
         offload_type="leaf_level",
         use_stream=False,
     )
+    # Interrupt between component forwards so Diffusers can finish its group offload/prefetch hooks.
+    pipe._easycolab_group_offloaded = True
     _trim_linux_cpu_heap()
     tag_suffix = "NVMe 分层卸载" if use_disk_offload else "分层流式卸载"
     return pipe, f"{spec['name']} · BF16 · {tag_suffix}"
@@ -4011,12 +4031,21 @@ def _image_pe_file_cached(path: str) -> bool:
         return False
 
 
+def _image_pe_weight_path(name: str) -> str:
+    destination = os.path.join(MODEL_BASE_ROOT, IMAGE_PE_GGUF_REPO, name)
+    if DRIVE_MOUNTED and not _image_pe_file_cached(destination):
+        for root in LEGACY_DRIVE_MODEL_ROOTS:
+            candidate = os.path.join(root, IMAGE_PE_GGUF_REPO, name)
+            if _image_pe_file_cached(candidate):
+                return candidate
+    return destination
+
+
 def _get_image_pe_status() -> Dict[str, Any]:
     if os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip():
         return {"mode": "remote", "weights_cached": False, "projector_cached": False, "downloading": False, "error": ""}
-    directory = os.path.join(MODEL_BASE_ROOT, IMAGE_PE_GGUF_REPO)
-    weights = os.path.join(directory, IMAGE_PE_WEIGHT)
-    projector = os.path.join(directory, IMAGE_PE_PROJECTOR)
+    weights = _image_pe_weight_path(IMAGE_PE_WEIGHT)
+    projector = _image_pe_weight_path(IMAGE_PE_PROJECTOR)
     weights_cached = _image_pe_file_cached(weights)
     projector_cached = _image_pe_file_cached(projector)
     with _IMAGE_PE_DOWNLOAD_LOCK:
@@ -4024,10 +4053,53 @@ def _get_image_pe_status() -> Dict[str, Any]:
             "mode": "local",
             "weights_cached": weights_cached,
             "projector_cached": projector_cached,
+            "weights_bytes": IMAGE_PE_FILE_SIZES[IMAGE_PE_WEIGHT] if weights_cached else _IMAGE_PE_DOWNLOAD_BYTES.get(weights),
+            "weights_total_bytes": IMAGE_PE_FILE_SIZES[IMAGE_PE_WEIGHT],
+            "projector_bytes": IMAGE_PE_FILE_SIZES[IMAGE_PE_PROJECTOR] if projector_cached else _IMAGE_PE_DOWNLOAD_BYTES.get(projector),
+            "projector_total_bytes": IMAGE_PE_FILE_SIZES[IMAGE_PE_PROJECTOR],
+            "weights_downloading": weights in _IMAGE_PE_DOWNLOADS,
+            "projector_downloading": projector in _IMAGE_PE_DOWNLOADS,
             "downloading": weights in _IMAGE_PE_DOWNLOADS or projector in _IMAGE_PE_DOWNLOADS,
             "error": (_IMAGE_PE_ERRORS.get(weights) if not weights_cached else "")
                      or (_IMAGE_PE_ERRORS.get(projector) if not projector_cached else "") or "",
         }
+
+
+def _image_pe_download_fraction(paths: List[str]) -> Optional[float]:
+    with _IMAGE_PE_DOWNLOAD_LOCK:
+        counts = [_IMAGE_PE_DOWNLOAD_BYTES.get(path) for path in paths]
+    total = 0
+    complete = 0
+    for path, count in zip(paths, counts):
+        expected = IMAGE_PE_FILE_SIZES[os.path.basename(path)]
+        total += expected
+        if count is None:
+            if not _image_pe_file_cached(path):
+                return None
+            count = expected
+        complete += count
+    return complete / total if total else None
+
+
+def _image_pe_progress_bar(path: str):
+    from tqdm.auto import tqdm
+
+    class FileProgress(tqdm):
+        def __init__(self, *args, **kwargs):
+            # Xet can report wire traffic and reconstructed file bytes separately.
+            name = kwargs.pop("name", "") or ""
+            self.track_file = not (name.endswith(".transfer") or str(kwargs.get("desc", "")).endswith(": downloading bytes"))
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+            self.update(0)
+
+        def update(self, n=1):
+            self.n += n
+            if self.track_file:
+                with _IMAGE_PE_DOWNLOAD_LOCK:
+                    _IMAGE_PE_DOWNLOAD_BYTES[path] = min(self.n, IMAGE_PE_FILE_SIZES[os.path.basename(path)])
+
+    return FileProgress
 
 
 def _download_image_pe_file(path: str, future: Future):
@@ -4036,10 +4108,15 @@ def _download_image_pe_file(path: str, future: Future):
     try:
         if not _image_pe_file_cached(path):
             from huggingface_hub import hf_hub_download
+            import inspect
+
+            options = {}
+            if "tqdm_class" in inspect.signature(hf_hub_download).parameters:
+                options["tqdm_class"] = _image_pe_progress_bar(path)
 
             hf_hub_download(
                 repo_id=IMAGE_PE_GGUF_REPO, revision=IMAGE_PE_GGUF_REVISION, filename=name,
-                local_dir=os.path.dirname(path), force_download=os.path.exists(path),
+                local_dir=os.path.dirname(path), force_download=os.path.exists(path), **options,
             )
             if not _image_pe_file_cached(path):
                 raise IOError(f"{name} 下载后的文件大小与发布版本不符")
@@ -4047,6 +4124,7 @@ def _download_image_pe_file(path: str, future: Future):
         failure = exc
     with _IMAGE_PE_DOWNLOAD_LOCK:
         _IMAGE_PE_DOWNLOADS.pop(path)
+        _IMAGE_PE_DOWNLOAD_BYTES.pop(path, None)
         if failure is None:
             future.set_result(path)
         else:
@@ -4057,9 +4135,8 @@ def _download_image_pe_file(path: str, future: Future):
 def _queue_image_pe_weights(include_projector: bool) -> Tuple[List[str], List[Future]]:
     """Prefetch missing GGUF files. Generation can await the same transfers as manual downloads."""
     _refresh_drive_mount_state()
-    directory = os.path.join(MODEL_BASE_ROOT, IMAGE_PE_GGUF_REPO)
     names = [IMAGE_PE_WEIGHT, IMAGE_PE_PROJECTOR] if include_projector else [IMAGE_PE_WEIGHT]
-    paths = [os.path.join(directory, name) for name in names]
+    paths = [_image_pe_weight_path(name) for name in names]
     futures = []
     for path in paths:
         if _image_pe_file_cached(path):
@@ -4080,19 +4157,37 @@ def _queue_image_pe_weights(include_projector: bool) -> Tuple[List[str], List[Fu
     return paths, futures
 
 
-def _build_image_pe_request(prompt: str, images: List[Any], width: int, height: int, seed: int) -> Dict[str, Any]:
+def _image_pe_prompt_directory():
     from pathlib import Path
-    from math import gcd
+    import hashlib
     from huggingface_hub import snapshot_download
 
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("请先输入要增强的图像指令。")
-    prompt_dir = Path(snapshot_download(
+    for root in [MODEL_BASE_ROOT, *(LEGACY_DRIVE_MODEL_ROOTS if DRIVE_MOUNTED else [])]:
+        directory = Path(root) / MINIMAX_IMAGE_PE_REPO / "prompt"
+        try:
+            for name, blob_id in IMAGE_PE_TEMPLATE_BLOBS.items():
+                content = (directory / name).read_bytes()
+                header = f"blob {len(content)}\0".encode()
+                if hashlib.sha1(header + content).hexdigest() != blob_id:
+                    break
+            else:
+                return directory
+        except FileNotFoundError:
+            continue
+    return Path(snapshot_download(
         repo_id=MINIMAX_IMAGE_PE_REPO,
-        revision="35603d4b63949afa12cb098227fffefedf081afa",
+        revision=IMAGE_PE_TEMPLATE_REVISION,
         allow_patterns=["prompt/t2i/*", "prompt/edit/task_prompt.txt"],
         local_dir=os.path.join(MODEL_BASE_ROOT, MINIMAX_IMAGE_PE_REPO),
     )) / "prompt"
+
+
+def _build_image_pe_request(prompt: str, images: List[Any], width: int, height: int, seed: int) -> Dict[str, Any]:
+    from math import gcd
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("请先输入要增强的图像指令。")
+    prompt_dir = _image_pe_prompt_directory()
     params = json.loads((prompt_dir / "t2i/request_params.json").read_text(encoding="utf-8"))
     if images:
         if width <= 0 or height <= 0:
@@ -4167,27 +4262,49 @@ def expand_image_prompt(
     prompt: str, *, images: List[Any], width: int, height: int, seed: int,
     cancel_event: Optional[threading.Event] = None,
     on_stage: Optional[Callable[[str], None]] = None,
+    on_expanded: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[str, Optional[float]], None]] = None,
 ) -> str:
     """Run the PE checkpoint for one batch while the caller holds GPU_LOCK."""
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
+
+    def request_caption(base_url):
+        check_cancelled()
+        if on_progress:
+            on_progress("expanding", None)
+        if on_stage:
+            on_stage("MiniMax-H3-Image-PE 正在增强提示词...")
+        caption = _request_image_pe_caption(base_url, payload, cancel_event)
+        if on_expanded:
+            on_expanded(caption)
+        return caption
+
+    check_cancelled()
     payload = _build_image_pe_request(prompt, images, width, height, seed)
+    check_cancelled()
     base_url = os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip()
     if base_url:
         # An operator can serve the original MiniMax checkpoint on a separate GPU with SGLang.
-        if on_stage:
-            on_stage("MiniMax-H3-Image-PE 正在增强提示词...")
-        return _request_image_pe_caption(base_url, payload, cancel_event)
+        return request_caption(base_url)
     paths, transfers = _queue_image_pe_weights(bool(images))
     if transfers and on_stage:
         on_stage("正在下载 MiniMax-H3-Image-PE 所需权重...")
+    if transfers and on_progress:
+        on_progress("downloading", None)
     for transfer in transfers:
         while cancel_event is not None and not transfer.done():
-            if cancel_event.wait(0.25):
+            if on_progress:
+                on_progress("downloading", _image_pe_download_fraction(paths))
+            if cancel_event.wait(0.5):
                 raise GenerationAbortedError("已手动停止当前推理任务")
         transfer.result()
-    if cancel_event is not None and cancel_event.is_set():
-        raise GenerationAbortedError("已手动停止当前推理任务")
+    check_cancelled()
     if on_stage:
         on_stage("正在加载 MiniMax-H3-Image-PE 到显存...")
+    if on_progress:
+        on_progress("loading", None)
     _reclaim_transient_gpu_memory()
     free_gib = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
     pe_context = 32768
@@ -4196,12 +4313,11 @@ def expand_image_prompt(
     bundle = _start_qwen_gguf_server(
         paths[0], paths[1] if images else None, ctx_len=pe_context, cur_free_gb=free_gib,
         image_max_tokens=image_max_tokens,
+        on_load_progress=(lambda value: on_progress("loading", value)) if on_progress else None,
         model_id="minimax_h3_image_pe", model_name=payload["model"], for_prompt_expansion=True, cancel_event=cancel_event,
     )
     try:
-        if on_stage:
-            on_stage("MiniMax-H3-Image-PE 正在增强提示词...")
-        return _request_image_pe_caption(bundle["base_url"] + "/v1", payload, cancel_event)
+        return request_caption(bundle["base_url"] + "/v1")
     finally:
         _stop_gguf_server_bundle(bundle)
 
@@ -4386,12 +4502,16 @@ def _build_llama_ld_env(install_dir: str) -> Dict[str, str]:
     return env
 
 
-def _download_file_to_path(url: str, dst_path: str, desc: str = ""):
+def _download_file_to_path(url: str, dst_path: str, desc: str = "", cancel_event: Optional[threading.Event] = None):
+    if cancel_event is not None and cancel_event.is_set():
+        raise GenerationAbortedError("已手动停止当前推理任务")
     req = urllib.request.Request(url, headers={"User-Agent": "EasyColab-Engine/1.0"})
     with urllib.request.urlopen(req, timeout=60) as resp, open(dst_path, "wb") as wf:
         total = int(resp.headers.get("Content-Length") or 0)
         done = 0
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise GenerationAbortedError("已手动停止当前推理任务")
             chunk = resp.read(4 * 1024 * 1024)
             if not chunk:
                 break
@@ -4405,13 +4525,22 @@ def _download_file_to_path(url: str, dst_path: str, desc: str = ""):
 _LLAMA_SERVER_INSTALL_LOCK = threading.Lock()
 
 
-def _ensure_llama_server_binary(report_progress: bool = True) -> Tuple[str, Dict[str, str]]:
+def _ensure_llama_server_binary(
+    report_progress: bool = True, cancel_event: Optional[threading.Event] = None,
+) -> Tuple[str, Dict[str, str]]:
     # A model-center download can run while a generation job prepares its PE server.
-    with _LLAMA_SERVER_INSTALL_LOCK:
-        return _install_or_reuse_llama_server(report_progress)
+    while not _LLAMA_SERVER_INSTALL_LOCK.acquire(timeout=0.25):
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
+        return _install_or_reuse_llama_server(report_progress, cancel_event)
+    finally:
+        _LLAMA_SERVER_INSTALL_LOCK.release()
 
 
-def _install_or_reuse_llama_server(report_progress: bool) -> Tuple[str, Dict[str, str]]:
+def _install_or_reuse_llama_server(report_progress: bool, cancel_event: Optional[threading.Event]) -> Tuple[str, Dict[str, str]]:
     """
     自动安装/校验官方 ggml-org/llama.cpp Linux x64 CUDA 12.8 预编译 llama-server + cudart 二进制。
     固定使用 ubuntu-cuda-12.x（NVIDIA 驱动向下兼容 CUDA 12.x/13.0/13.5+ 全系驱动，避免 CUDA 13.5 PTX 在 Colab 13.0 驱动上报 unsupported toolchain）。
@@ -4515,7 +4644,7 @@ def _install_or_reuse_llama_server(report_progress: bool) -> Tuple[str, Dict[str
 
     print(f"[GGUF 引擎] 正在下载官方预编译 llama.cpp CUDA 12 推理后端: {os.path.basename(main_url)} ...")
     tar_path = os.path.join(install_dir, "llama_cuda_bin.tar.gz")
-    _download_file_to_path(main_url, tar_path, desc="正在下载 llama.cpp CUDA 引擎" if report_progress else "")
+    _download_file_to_path(main_url, tar_path, desc="正在下载 llama.cpp CUDA 引擎" if report_progress else "", cancel_event=cancel_event)
     subprocess.check_call(["tar", "-xzf", tar_path, "-C", install_dir])
     try:
         os.remove(tar_path)
@@ -4525,7 +4654,7 @@ def _install_or_reuse_llama_server(report_progress: bool) -> Tuple[str, Dict[str
     if cudart_url:
         print(f"[GGUF 引擎] 正在下载配套 CUDA 12 Runtime 动态库 ({os.path.basename(cudart_url)})...")
         rt_tar = os.path.join(install_dir, "cudart_bin.tar.gz")
-        _download_file_to_path(cudart_url, rt_tar, desc="正在下载 CUDA Runtime 动态库" if report_progress else "")
+        _download_file_to_path(cudart_url, rt_tar, desc="正在下载 CUDA Runtime 动态库" if report_progress else "", cancel_event=cancel_event)
         subprocess.check_call(["tar", "-xzf", rt_tar, "-C", install_dir])
         try:
             os.remove(rt_tar)
@@ -4561,6 +4690,33 @@ def _pick_free_local_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _gguf_load_fraction(line: str, stage_bytes: Dict[str, int]) -> Optional[float]:
+    """Combine llama.cpp router load events using each GGUF file's size."""
+    prefix = "cmd_child_to_router:state:"
+    if not line.startswith(prefix) or not stage_bytes:
+        return None
+    try:
+        event = json.loads(line[len(prefix):])
+    except ValueError:
+        return None
+    if not isinstance(event, dict) or event.get("state") != "loading":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("stages") != list(stage_bytes):
+        return None
+    current, value = payload.get("current"), payload.get("value")
+    if not isinstance(current, str) or current not in stage_bytes:
+        return None
+    if type(value) not in (int, float) or not 0 <= value <= 1:
+        return None
+    completed = 0
+    for stage, size in stage_bytes.items():
+        if stage == current:
+            return (completed + value * size) / sum(stage_bytes.values())
+        completed += size
+    return None
+
+
 def _start_qwen_gguf_server(
     gguf_path: str,
     mmproj_path: Optional[str],
@@ -4573,13 +4729,14 @@ def _start_qwen_gguf_server(
     for_prompt_expansion: bool = False,
     cancel_event: Optional[threading.Event] = None,
     image_max_tokens: Optional[int] = None,
+    on_load_progress: Optional[Callable[[float], None]] = None,
 ) -> Dict[str, Any]:
     """
     启动驻留 GPU 的 llama-server 实例加载 GGUF 主模型 + 可选 mmproj 视觉投影器 + 可选 MTP 投机解码头。
     集成 Unsloth Native MTP 投机解码 (--spec-type draft-mtp)、GPU 端采样 (--backend-sampling)、
     超大 MoE 专家权重自动异构卸载 (-ot ".ffn_.*_exps.=CPU") 与 q8_0/q4_0 高带宽 KV Cache。
     """
-    bin_path, env = _ensure_llama_server_binary(report_progress=not for_prompt_expansion)
+    bin_path, env = _ensure_llama_server_binary(report_progress=not for_prompt_expansion, cancel_event=cancel_event)
 
     try:
         weights_gb = float(total_weights_gb) if (total_weights_gb and total_weights_gb > 0) else (os.path.getsize(gguf_path) / (1024 ** 3))
@@ -4632,6 +4789,17 @@ def _start_qwen_gguf_server(
 
     opener = _make_noproxy_opener()
     last_err = ""
+    stage_bytes = {}
+    if for_prompt_expansion and on_load_progress is not None:
+        try:
+            stage_bytes["text_model"] = os.path.getsize(gguf_path)
+            if mmproj_path and os.path.exists(mmproj_path):
+                stage_bytes["mmproj_model"] = os.path.getsize(mmproj_path)
+            if min(stage_bytes.values()) <= 0:
+                stage_bytes.clear()
+        except OSError:
+            stage_bytes.clear()
+    previous_progress = None
 
     for attempt_idx, (kv_type, ngl_val, use_mtp, moe_ot) in enumerate(attempts):
         if cancel_event is not None and cancel_event.is_set():
@@ -4704,85 +4872,98 @@ def _start_qwen_gguf_server(
         recent_logs: List[str] = []
         proc = subprocess.Popen(
             cmd,
-            env=env,
+            env={**env, "LLAMA_SERVER_ROUTER_PORT": str(port)} if for_prompt_expansion else env,
+            stdin=subprocess.PIPE if for_prompt_expansion else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
 
-        def _drain_stdout(p: subprocess.Popen, log_buf: List[str]):
-            try:
-                assert p.stdout is not None
-                for raw_line in p.stdout:
-                    ln = raw_line.rstrip("\r\n")
-                    if not ln:
-                        continue
-                    log_buf.append(ln)
-                    if len(log_buf) > 100:
-                        del log_buf[:25]
-            except Exception:
-                pass
+        with contextlib.ExitStack() as owner:
+            owner.callback(_stop_gguf_server_bundle, {"backend": "gguf", "server_proc": proc})
+            # Only the health-check loop publishes progress. A reader finishing after
+            # a retry or after handoff can only update its own attempt's snapshot.
+            progress_snapshot: Dict[str, float] = {}
 
-        threading.Thread(target=_drain_stdout, args=(proc, recent_logs), daemon=True).start()
+            def _drain_stdout(p: subprocess.Popen, log_buf: List[str], snapshot: Dict[str, float]):
+                try:
+                    assert p.stdout is not None
+                    for raw_line in p.stdout:
+                        ln = raw_line.rstrip("\r\n")
+                        if not ln:
+                            continue
+                        if stage_bytes and ln.startswith("cmd_child_to_router:"):
+                            fraction = _gguf_load_fraction(ln, stage_bytes)
+                            if fraction is not None and fraction < 1:
+                                snapshot["fraction"] = fraction
+                            continue
+                        log_buf.append(ln)
+                        if len(log_buf) > 100:
+                            del log_buf[:25]
+                except Exception:
+                    pass
 
-        health_url = f"http://127.0.0.1:{port}/health"
-        deadline = time.time() + 240.0
-        ready = False
-        while time.time() < deadline:
-            if cancel_event is not None and cancel_event.is_set():
-                _stop_gguf_server_bundle({"backend": "gguf", "server_proc": proc})
-                raise GenerationAbortedError("已手动停止当前推理任务")
-            if proc.poll() is not None:
-                break
-            try:
-                with opener.open(health_url, timeout=2.0) as h_resp:
-                    if h_resp.status == 200:
-                        ready = True
-                        break
-            except urllib.error.HTTPError as he:
-                # 503 表示 llama-server 正在加载权重到显存
-                if he.code == 503 and not for_prompt_expansion:
-                    MODEL_DOWNLOAD_STATE["progress"] = min(0.95, round(MODEL_DOWNLOAD_STATE["progress"] + 0.01, 2))
-            except Exception:
-                pass
-            time.sleep(0.5)
+            threading.Thread(target=_drain_stdout, args=(proc, recent_logs, progress_snapshot), daemon=True).start()
+            if previous_progress is not None:
+                on_load_progress(0.0)
+                previous_progress = 0.0
 
-        if ready:
-            ctx_k_str = f"{ctx_len // 1024}K"
-            if model_id == "qwen38_27b_gguf":
-                quant_tag = "UD-Q4_K_M+MTP" if use_mtp else "UD-Q4_K_M"
-                mode_label = f"Qwen3.8-27B · {quant_tag} · {ctx_k_str} (KV:{kv_type})"
-            else:
-                extra_tag = " · MTP" if use_mtp else (" · MoE异构" if moe_ot else "")
-                mode_label = f"{model_name} · GGUF{extra_tag} · {ctx_k_str} (KV:{kv_type})"
-            print(f"[GGUF 引擎] {model_name} 已就绪 ({mode_label})")
-            return {
-                "backend": "gguf",
-                "model_id": model_id,
-                "model_name": model_name,
-                "port": port,
-                "base_url": f"http://127.0.0.1:{port}",
-                "server_proc": proc,
-                "context_length": ctx_len,
-                "kv_type": kv_type,
-                "mtp_enabled": use_mtp,
-                "mode_label": mode_label,
-                "gguf_path": gguf_path,
-                "mmproj_path": mmproj_path,
-                "mtp_path": mtp_path if use_mtp else None,
-            }
+            health_url = f"http://127.0.0.1:{port}/health"
+            deadline = time.time() + 240.0
+            ready = False
+            while time.time() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationAbortedError("已手动停止当前推理任务")
+                if proc.poll() is not None:
+                    break
+                fraction = progress_snapshot.get("fraction")
+                if fraction is not None and (previous_progress is None or fraction > previous_progress):
+                    on_load_progress(fraction)
+                    previous_progress = fraction
+                try:
+                    with opener.open(health_url, timeout=2.0) as h_resp:
+                        if h_resp.status == 200:
+                            ready = True
+                            break
+                except urllib.error.HTTPError as he:
+                    # 503 表示 llama-server 正在加载权重到显存
+                    if he.code == 503 and not for_prompt_expansion:
+                        MODEL_DOWNLOAD_STATE["progress"] = min(0.95, round(MODEL_DOWNLOAD_STATE["progress"] + 0.01, 2))
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
-        # 未就绪：清理子进程并记录日志
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=3.0)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            if ready:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise GenerationAbortedError("已手动停止当前推理任务")
+                if for_prompt_expansion and on_load_progress is not None:
+                    on_load_progress(1.0)
+                ctx_k_str = f"{ctx_len // 1024}K"
+                if model_id == "qwen38_27b_gguf":
+                    quant_tag = "UD-Q4_K_M+MTP" if use_mtp else "UD-Q4_K_M"
+                    mode_label = f"Qwen3.8-27B · {quant_tag} · {ctx_k_str} (KV:{kv_type})"
+                else:
+                    extra_tag = " · MTP" if use_mtp else (" · MoE异构" if moe_ot else "")
+                    mode_label = f"{model_name} · GGUF{extra_tag} · {ctx_k_str} (KV:{kv_type})"
+                print(f"[GGUF 引擎] {model_name} 已就绪 ({mode_label})")
+                bundle = {
+                    "backend": "gguf",
+                    "model_id": model_id,
+                    "model_name": model_name,
+                    "port": port,
+                    "base_url": f"http://127.0.0.1:{port}",
+                    "server_proc": proc,
+                    "context_length": ctx_len,
+                    "kv_type": kv_type,
+                    "mtp_enabled": use_mtp,
+                    "mode_label": mode_label,
+                    "gguf_path": gguf_path,
+                    "mmproj_path": mmproj_path,
+                    "mtp_path": mtp_path if use_mtp else None,
+                }
+                owner.pop_all()
+                return bundle
 
         tail_txt = "\n".join(recent_logs[-12:])
         last_err = tail_txt or "llama-server 启动超时"
@@ -4847,12 +5028,9 @@ def _release_pipeline_object(pipe_obj: Any):
     if pipe_obj is None:
         return
     try:
-        cm = getattr(pipe_obj, "components_manager", None)
-        if cm is not None:
-            for attr_dict_name in ("components", "_components", "_offload_hooks"):
-                d = getattr(cm, attr_dict_name, None)
-                if isinstance(d, dict):
-                    d.clear()
+        if getattr(pipe_obj, "_components_manager", None) is not None:
+            # The pipe owns this reference. A manager can also be shared by another loaded pipeline.
+            pipe_obj._components_manager = None
         for sub_attr in ("transformer", "text_encoder", "vae", "dit", "video_vae", "audio_vae"):
             sub_mod = getattr(pipe_obj, sub_attr, None)
             if sub_mod is not None:
@@ -5788,9 +5966,12 @@ def _enable_high_vram_optimizations(
     return "大显存常驻加速"
 
 
-def _reclaim_transient_gpu_memory():
+def _reclaim_transient_gpu_memory(*, trim_cpu: bool = False):
     """在连续视频/图像生成前后主动回收 Python 引用与 CUDA 缓存碎片，杜绝第 2 条视频中途 OOM 崩溃"""
-    gc.collect()
+    if trim_cpu:
+        _trim_linux_cpu_heap()
+    else:
+        gc.collect()
     if torch.cuda.is_available():
         try:
             torch.cuda.empty_cache()
@@ -8207,9 +8388,8 @@ def _pipeline_job_execution_guard(
     media_type: str,
 ):
     """
-    为所有 DiffSynth 视频/生图管线注入全链路真实进度与毫秒级 GPU 中断守卫：
-    1. 挂载层块级 forward_pre_hook：点击停止推理后在当前 Transformer Block 结束时 (<0.1s) 立即抛出 GenerationAbortedError，
-       瞬时释放 GPU_LOCK，彻底杜绝僵尸任务阻塞新任务。
+    为视频和生图管线挂载推理中断钩子，并为 DiffSynth 管线提供阶段进度：
+    1. 在组件或 Transformer Block 的前向调用边界检查停止请求。
     2. 接管 progress_bar_cmd 与阶段切换 load_models_to_device：
        - 0.04 ~ 0.08: 多模态提示词编码与潜空间初始化
        - 0.08 ~ 0.82 (图像 0.90): DiT 逐步去噪采样（每步实时刷新百分比与剩余时间，单行刷新不堆叠）
@@ -8231,15 +8411,21 @@ def _pipeline_job_execution_guard(
         if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
             raise GenerationAbortedError("已手动停止当前推理任务")
 
-    # 为管线主干及内部 Transformer Blocks 挂载轻量级中断钩子，使长耗时单步也能在 ~100ms 内立刻中止
+    # Group-offloaded components must finish their transfer hooks before stopping at the next component.
+    component_ids = set()
     try:
         seen_mods = set()
-        for _, child in pipe.named_children():
+        named_children = getattr(pipe, "named_children", None)
+        children = named_children() if callable(named_children) else getattr(pipe, "components", {}).items()
+        for _, child in children:
             if child is None or not isinstance(child, torch.nn.Module):
                 continue
+            component_ids.add(id(child))
             if id(child) not in seen_mods:
                 seen_mods.add(id(child))
-                hook_handles.append(child.register_forward_pre_hook(_abort_pre_hook))
+                hook_handles.append(child.register_forward_pre_hook(_abort_pre_hook, prepend=True))
+            if getattr(pipe, "_easycolab_group_offloaded", False):
+                continue
             for sub_name, sub_mod in child.named_modules():
                 if isinstance(sub_mod, torch.nn.ModuleList) and any(
                     k in sub_name for k in ("blocks", "layers")
@@ -8247,9 +8433,9 @@ def _pipeline_job_execution_guard(
                     for blk in sub_mod:
                         if isinstance(blk, torch.nn.Module) and id(blk) not in seen_mods:
                             seen_mods.add(id(blk))
-                            hook_handles.append(blk.register_forward_pre_hook(_abort_pre_hook))
-    except Exception:
-        pass
+                            hook_handles.append(blk.register_forward_pre_hook(_abort_pre_hook, prepend=True))
+    except Exception as exc:
+        print(f"[任务控制] 部分模型中断钩子未能注册: {exc}")
 
     if orig_load_fn is not None:
         def _stage_aware_load_models(self_pipe, model_names):
@@ -8349,6 +8535,19 @@ def _pipeline_job_execution_guard(
 
     try:
         yield _job_progress_bar
+        _check_abort()
+    except Exception:
+        # ComponentsManager retains the last active modules on CUDA until another forward needs space.
+        # Restore this pipeline's original CPU standby placement without removing its offload hooks.
+        if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
+            manager = getattr(pipe, "_components_manager", None)
+            for hook in getattr(manager, "model_hooks", ()) or ():
+                if id(hook.model) in component_ids and getattr(getattr(hook.model, "device", None), "type", None) == "cuda":
+                    try:
+                        hook.offload()
+                    except Exception as exc:
+                        print(f"[任务控制] 暂存 {type(hook.model).__name__} 到 CPU 失败: {exc}")
+        raise
     finally:
         CURRENT_STAGE_BAR_LABEL = None
         if orig_load_fn is not None:
@@ -8361,6 +8560,21 @@ def _pipeline_job_execution_guard(
 
 
 def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
+    try:
+        failure = _execute_generation_job(job_id, req)
+        # Inference frames, exception tracebacks and decoded references have gone out of scope.
+        # Running empty_cache inside the except block leaves their CUDA allocations live.
+        if failure:
+            try:
+                _reclaim_transient_gpu_memory(trim_cpu=True)
+            finally:
+                JOBS[job_id].update(status="failed", message=failure)
+    finally:
+        _JOB_CANCEL_EVENTS.pop(job_id, None)
+        touch_activity()
+
+
+def _execute_generation_job(job_id: str, req: GenerateVideoRequest):
     touch_activity()
     job_cancel_event = _JOB_CANCEL_EVENTS.setdefault(job_id, threading.Event())
     active_model_id = (
@@ -8486,14 +8700,22 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         if not job_cancel_event.is_set():
                             JOBS[job_id]["message"] = message
 
+                    def update_pe_progress(stage: str, fraction: Optional[float]):
+                        if not job_cancel_event.is_set():
+                            JOBS[job_id].update(pe_stage=stage, pe_progress=fraction)
+
                     set_pe_stage("正在准备 MiniMax-H3-Image-PE 提示词模板...")
-                    image_prompt = expand_image_prompt(
-                        image_prompt, images=edit_images, width=req.width, height=req.height, seed=current_seed,
-                        cancel_event=job_cancel_event, on_stage=set_pe_stage,
-                    )
+                    try:
+                        image_prompt = expand_image_prompt(
+                            image_prompt, images=edit_images, width=req.width, height=req.height, seed=current_seed,
+                            cancel_event=job_cancel_event, on_stage=set_pe_stage, on_progress=update_pe_progress,
+                            on_expanded=lambda caption: JOBS[job_id].update(expanded_prompt=caption),
+                        )
+                    finally:
+                        JOBS[job_id].pop("pe_stage", None)
+                        JOBS[job_id].pop("pe_progress", None)
                     if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
                         raise GenerationAbortedError("已手动停止当前推理任务")
-                    JOBS[job_id]["expanded_prompt"] = image_prompt
                     JOBS[job_id]["message"] = f"{spec['name']} 正在使用增强后的指令生成图像..."
 
                 with _pipeline_job_execution_guard(
@@ -8670,6 +8892,8 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                 )
             touch_activity()
 
+        if job_cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
         elapsed = round(time.time() - start_time, 1)
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["progress"] = 1.0
@@ -8686,22 +8910,13 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
     except GenerationAbortedError as abort_err:
         with CONSOLE_LOCK:
             ACTIVE_TQDM_BARS.clear()
-        _reclaim_transient_gpu_memory()
-        if job_id in JOBS:
-            JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["progress"] = 0.0
-            JOBS[job_id]["message"] = str(abort_err) or "已手动停止当前推理任务"
+        JOBS[job_id]["progress"] = 0.0
         print(f"[任务控制] 任务 {job_id} 已中断并释放 GPU 显存锁。")
+        return str(abort_err) or "已手动停止当前推理任务"
     except Exception as e:
         with CONSOLE_LOCK:
             ACTIVE_TQDM_BARS.clear()
-        _reclaim_transient_gpu_memory()
-        if job_id in JOBS:
-            JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["message"] = f"生成出错: {str(e)}"
-    finally:
-        _JOB_CANCEL_EVENTS.pop(job_id, None)
-        touch_activity()
+        return "已手动停止当前推理任务" if job_cancel_event.is_set() else f"生成出错: {e}"
 
 
 class ApiKeyConfigRequest(BaseModel):
@@ -10368,13 +10583,11 @@ def attach_macos_api_routes(app: FastAPI):
         global CURRENT_STAGE_BAR_LABEL
         touch_activity()
         ABORT_GENERATION_EVENT.set()
-        for ev in list(_JOB_CANCEL_EVENTS.values()):
+        for jid, ev in list(_JOB_CANCEL_EVENTS.items()):
             ev.set()
-        for jid, j in list(JOBS.items()):
-            if j.get("status") in ("queued", "running"):
-                j["status"] = "failed"
-                j["progress"] = 0.0
-                j["message"] = "已手动停止当前推理任务"
+            j = JOBS.get(jid)
+            if j and j.get("status") in ("queued", "running"):
+                j["message"] = "正在停止当前推理任务..."
         CURRENT_STAGE_BAR_LABEL = None
         with CONSOLE_LOCK:
             ACTIVE_TQDM_BARS.clear()
@@ -10383,8 +10596,6 @@ def attach_macos_api_routes(app: FastAPI):
         def _clear_abort_after_release():
             with GPU_LOCK:
                 ABORT_GENERATION_EVENT.clear()
-                with CONSOLE_LOCK:
-                    ACTIVE_TQDM_BARS.clear()
 
         threading.Thread(target=_clear_abort_after_release, daemon=True).start()
         return get_gpu_status_dict(model_id=SELECTED_MODEL_ID)

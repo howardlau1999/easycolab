@@ -12,6 +12,7 @@ struct MainStudioView: View {
     @Environment(\.colorScheme) var colorScheme
     @State var showFileList: Bool = false
     @State var showNegativePrompt: Bool = false
+    @State var showExpandedImagePrompt = true
     @State var openaiSnippetTab: Int = 0
     @State var anthropicSnippetTab: Int = 0
     @State var showRightLogPanel: Bool = true
@@ -477,6 +478,27 @@ struct MainStudioView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(vm.isWakingColab)
+            }
+            Toggle(L("使用 Drive 权重", "Use Drive weights"), isOn: $vm.useDriveWeights)
+                .toggleStyle(.checkbox)
+                .disabled(vm.isWakingColab)
+                .help(L("唤醒时挂载 Google Drive 并复用已备份的模型权重。", "Mount Google Drive on wake and reuse backed-up model weights."))
+            if let url = vm.wakeDriveConsentURL {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L("此实例需要 Google Drive 授权。", "This instance needs Google Drive authorization."))
+                    Button(L("打开 Google 授权页", "Open Google authorization")) {
+                        NSWorkspace.shared.open(url)
+                    }
+                    HStack {
+                        Button(L("已授权，继续", "I’ve authorized, continue")) { vm.confirmWakeDriveConsent() }
+                            .buttonStyle(.borderedProminent)
+                        Button(L("取消部署", "Cancel deployment")) {
+                            vm.stopActiveWakeProcess()
+                            vm.statusMessage = L("已取消部署，实例仍在运行。", "Deployment canceled. The instance is still running.")
+                        }
+                    }
+                }
+                .controlSize(.small)
             }
         }
 

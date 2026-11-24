@@ -45,11 +45,13 @@ Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Go
 
 在图像编辑模式中，MiniMax-H3-Image 最多支持 16 张参考图，Qwen-Image-2.1 最多 10 张，Z-Image-Turbo 支持 1 张。开启 PE 时，它会按界面顺序读取每张图的内容，结合编辑指令和输出宽高比扩写提示词，再把扩写结果和同一组参考图交给生图模型。使用 MiniMax 时，可以写「保留 `<Picture 1>` 中的人物，换上 `<Picture 2>` 的外套，背景参考 `<Picture 3>`」。[MiniMax 模型说明](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) · [Qwen 模型说明](https://huggingface.co/Qwen/Qwen-Image-2.1)
 
-勾选开关后，Mac 客户端会显示 Colab 是否已缓存 PE 权重。文生图需要约 17 GB 的主模型，参考图编辑另需约 931 MB 的视觉投影文件。可以提前点击下载，也可以直接生成，让 Colab 自动补齐缺少的文件。
+勾选开关后，Mac 客户端会分别显示 PE 主模型和视觉投影文件的缓存状态、下载字节数与进度。文生图需要约 17 GB 的主模型，参考图编辑另需约 931 MB 的视觉投影文件。可以提前点击下载，也可以直接生成，让 Colab 自动补齐缺少的文件。生成任务会区分下载、加载和扩写三个阶段，加载百分比来自推理引擎。引擎尚未报告数值时显示当前阶段。
 
-开始生成后，Colab 自动将 PE 加载到显存。提示词增强完成后，Colab 释放 PE，再用选定的生图模型采样。下次生成可复用已下载的权重。[MiniMax 官方模型与提示词](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) · [GGUF 转换权重](https://huggingface.co/prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF)
+开始生成后，Colab 自动将 PE 加载到显存。扩写完成后，可以在生图工作区查看并复制本批次实际使用的提示词。Colab 释放 PE，再用选定的生图模型采样。停止任务后，生图模型仍可供下次生成使用。要同时释放模型权重占用的显存和内存，在左侧模型中心点击卸载。[MiniMax 官方模型与提示词](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) · [GGUF 转换权重](https://huggingface.co/prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF)
 
 已有 SGLang 部署时，可在启动 EasyColab 服务端前设置 `EASYCOLAB_IMAGE_PE_BASE_URL`（例如 `http://127.0.0.1:30000/v1`），并使用官方服务名 `MiniMax-H3-Image-PE`。此时提示词和修图参考图会发送到该服务，EasyColab 仅需下载官方提示词模板与请求参数。
+
+**在新 Colab 实例中复用 Drive 权重。** Mac 侧栏的「使用 Drive 权重」默认开启。点击「唤醒实例并部署」，如出现 Google 授权提示，点击「打开 Google 授权页」，选择保存模型的账号，允许访问后回到 App 点「已授权，继续」。日志出现「已验证 Google Drive 挂载」后，服务会从「我的云端硬盘 / EasyColab_Models」查找已有权重。在模型中心选择 MiniMax-H3-Image，看到 27/27 后直接加载即可。挂载失败时，部署会停下并提示重试。
 
 `POST /v1/images/generations` 支持布尔字段 `"enhance_prompt": true`。在 `model` 中填写生图模型，响应中每张图的 `revised_prompt` 是实际用于生成的提示词。
 

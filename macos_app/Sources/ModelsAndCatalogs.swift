@@ -614,6 +614,12 @@ struct ImagePEStatus: Codable {
     let weights_cached: Bool
     let projector_cached: Bool
     let downloading: Bool
+    let weights_bytes: Int64?
+    let weights_total_bytes: Int64?
+    let projector_bytes: Int64?
+    let projector_total_bytes: Int64?
+    let weights_downloading: Bool?
+    let projector_downloading: Bool?
     let error: String?
 }
 
@@ -888,6 +894,9 @@ struct ColabJobResponse: Codable {
     var filename: String?
     var video_url: String?
     var media_type: String?
+    var expanded_prompt: String?
+    var pe_stage: String?
+    var pe_progress: Double?
     var text_output: String?
     var thinking_output: String?
     var batch_count: Int?
@@ -895,6 +904,30 @@ struct ColabJobResponse: Codable {
     var completed_videos: [CompletedMediaItem]?
     var console_lines: [String]?
     var telemetry: LiveTelemetrySnapshot?
+}
+
+struct ImagePEJobProgress: Equatable {
+    enum Stage: String {
+        case downloading, loading, expanding
+    }
+
+    let stage: Stage
+    let fraction: Double?
+
+    init?(_ job: ColabJobResponse) {
+        guard job.status == "queued" || job.status == "running",
+              let name = job.pe_stage, let stage = Stage(rawValue: name) else { return nil }
+        self.stage = stage
+        fraction = job.pe_progress.flatMap { (0...1).contains($0) ? $0 : nil }
+    }
+
+    var title: String {
+        switch stage {
+        case .downloading: return L("正在下载 PE 权重", "Downloading PE weights")
+        case .loading: return L("正在加载 PE 模型", "Loading the PE model")
+        case .expanding: return L("正在增强提示词", "Expanding the prompt")
+        }
+    }
 }
 
 struct BridgeAuthStatusResponse: Codable {

@@ -1682,6 +1682,10 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         elif spec.modality == ModelModality.IMAGE:
             self.studio_stack.setCurrentIndex(3)
             self.img_refs_card.setVisible(self.vm.task_mode_id == "i2i_edit")
+            expanded = self.vm.expanded_image_prompt
+            self.img_expanded_box.setVisible(bool(expanded))
+            if self.img_expanded_text.toPlainText() != expanded:
+                self.img_expanded_text.setPlainText(expanded)
             self._sync_edit_reference_controls()
             self.shared_media_split.setVisible(True)
             self.right_gallery_stack.setCurrentIndex(0)
@@ -1729,17 +1733,22 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         stop_btn: QPushButton = getattr(self, f"{prefix}_stop_btn")
         prog: QProgressBar = getattr(self, f"{prefix}_prog_bar")
         if self.vm.is_generating:
-            pct = int(self.vm.progress_value * 100)
-            gen_btn.setText(
-                tr(
-                    f"正在云端推理中... {pct}% · 已用时 {format_duration(self.vm.current_job_elapsed)}",
-                    f"Inferring on Cloud... {pct}% · Elapsed {format_duration(self.vm.current_job_elapsed)}",
-                )
-            )
+            stage = {
+                "downloading": tr("下载 PE 权重", "Downloading PE weights"),
+                "loading": tr("加载 PE 模型", "Loading PE model"),
+                "expanding": tr("PE 增强提示词", "Expanding prompt"),
+            }.get(self.vm.pe_stage) if prefix == "img" else None
+            progress = self.vm.pe_progress if stage else self.vm.progress_value
+            label = stage or tr("正在云端推理中...", "Inferring on Cloud...")
+            if progress is not None:
+                label += f" {int(progress * 100)}%"
+            gen_btn.setText(f"{label} · {format_duration(self.vm.current_job_elapsed)}")
             gen_btn.setEnabled(False)
             stop_btn.setEnabled(True)
             prog.setVisible(True)
-            prog.setValue(pct)
+            prog.setRange(0, 100 if progress is not None else 0)
+            if progress is not None:
+                prog.setValue(int(progress * 100))
         else:
             gen_btn.setText(idle_label)
             gen_btn.setEnabled(True)

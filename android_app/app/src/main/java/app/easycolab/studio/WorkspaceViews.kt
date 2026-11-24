@@ -1307,6 +1307,23 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+                vm.expandedImagePrompt?.let { expanded ->
+                    OutlinedTextField(
+                        value = expanded,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text(L("PE 增强后的提示词", "Expanded prompt")) },
+                        trailingIcon = {
+                            IconButton(onClick = {
+                                vm.copyToClipboard(context, "Expanded prompt", expanded, L("已复制提示词", "Prompt copied"))
+                            }) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = L("复制提示词", "Copy prompt"))
+                            }
+                        },
+                        maxLines = 6,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
 
             // Audio Prompts for MiniMax-H3
@@ -1461,21 +1478,27 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
 
             // Generate / Cancel CTA
             if (vm.isGenerating) {
+                val stage = when (vm.peStage) {
+                    "downloading" -> L("下载 PE 权重", "Downloading PE weights")
+                    "loading" -> L("加载 PE 模型", "Loading PE model")
+                    "expanding" -> L("PE 增强提示词", "Expanding prompt")
+                    else -> null
+                }
+                val progress = if (stage == null) vm.progressValue else vm.peProgress
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    LinearProgressIndicator(
-                        progress = { vm.progressValue.coerceIn(0.02f, 1f) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(7.dp)
-                            .clip(CircleShape)
-                    )
+                    val bar = Modifier.fillMaxWidth().height(7.dp).clip(CircleShape)
+                    if (progress == null) {
+                        LinearProgressIndicator(modifier = bar)
+                    } else {
+                        LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = bar)
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "${(vm.progressValue * 100).toInt()}% · ${formatDuration(vm.currentJobElapsed)}",
+                            text = listOfNotNull(stage, progress?.let { "${(it * 100).toInt()}%" }, formatDuration(vm.currentJobElapsed)).joinToString(" · "),
                             fontSize = 12.sp,
                             fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.primary

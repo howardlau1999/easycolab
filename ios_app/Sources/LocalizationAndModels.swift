@@ -985,6 +985,9 @@ struct ColabJobResponse: Codable {
     var filename: String?
     var video_url: String?
     var media_type: String?
+    var expanded_prompt: String?
+    var pe_stage: String?
+    var pe_progress: Double?
     var text_output: String?
     var thinking_output: String?
     var batch_count: Int?

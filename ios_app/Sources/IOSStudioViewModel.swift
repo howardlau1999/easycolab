@@ -179,6 +179,9 @@ final class IOSStudioViewModel: ObservableObject {
     @Published var taskModeId: String = "t2va"
     @Published var visualPrompt: String = PRESET_TEMPLATES[0].visual
     @Published var enhanceImagePrompt = false
+    @Published private(set) var expandedImagePrompt: String?
+    @Published private(set) var peStage: String?
+    @Published private(set) var peProgress: Double?
     @Published var negativePrompt: String = ""
     @Published var soundscapePrompt: String = PRESET_TEMPLATES[0].soundscape
     @Published var musicPrompt: String = PRESET_TEMPLATES[0].music
@@ -791,6 +794,8 @@ final class IOSStudioViewModel: ObservableObject {
 
     func switchSelectedModel(_ spec: OpenModelSpec) {
         guard selectedModelId != spec.id else { return }
+        expandedImagePrompt = nil
+        peStage = nil
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         selectedModelId = spec.id
         taskModeId = spec.modes[0].id
@@ -958,7 +963,9 @@ final class IOSStudioViewModel: ObservableObject {
     }
 
     func cancelCurrentGeneration() async {
-        activeGenerationToken = UUID()
+        let stoppedJob = activeModelSpec.modality == .image && expandedImagePrompt == nil ? pendingJobId : nil
+        let cancelToken = UUID()
+        activeGenerationToken = cancelToken
         pendingJobId = nil
         stopLiveGenerationTimer()
         endIOSBackgroundExecution()
@@ -971,10 +978,36 @@ final class IOSStudioViewModel: ObservableObject {
         req.httpMethod = "POST"
         req.timeoutInterval = 12
         if let (data, _) = try? await URLSession.shared.data(for: req),
-           let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data) {
+           let dec = try? JSONDecoder().decode(ColabStatusResponse.self, from: data), activeGenerationToken == cancelToken {
             applyStatusResponse(dec)
         }
+        guard activeGenerationToken == cancelToken else { return }
         statusMessage = L("已停止当前生成任务。", "Stopped current generation job.")
+        if let stoppedJob, let jobURL = URL(string: "\(base)/minimax_api/job/\(stoppedJob)"),
+           let (data, _) = try? await URLSession.shared.data(from: jobURL),
+           activeGenerationToken == cancelToken,
+           let job = try? JSONDecoder().decode(ColabJobResponse.self, from: data) {
+            updatePromptEnhancement(job)
+        }
+    }
+
+    private func updatePromptEnhancement(_ job: ColabJobResponse) {
+        guard job.model_id == selectedModelId else { return }
+        if peStage != job.pe_stage { peStage = job.pe_stage }
+        let progress = job.pe_progress.map { min(1, max(0, $0)) }
+        if peProgress != progress { peProgress = progress }
+        if let prompt = job.expanded_prompt, !prompt.isEmpty, prompt != expandedImagePrompt {
+            expandedImagePrompt = prompt
+        }
+    }
+
+    var peStageLabel: String? {
+        switch peStage {
+        case "downloading": return L("下载 PE 权重", "Downloading PE weights")
+        case "loading": return L("加载 PE 模型", "Loading PE model")
+        case "expanding": return L("PE 增强提示词", "Expanding prompt")
+        default: return nil
+        }
     }
 
     func startGeneration() async {
@@ -1026,6 +1059,10 @@ final class IOSStudioViewModel: ObservableObject {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         let myToken = UUID()
         activeGenerationToken = myToken
+        expandedImagePrompt = nil
+        peStage = nil
+        peProgress = nil
+        pendingJobId = nil
         isGenerating = true
         progressValue = 0.0
         currentJobElapsed = 0.0
@@ -1106,6 +1143,7 @@ final class IOSStudioViewModel: ObservableObject {
             let (data, _) = try await URLSession.shared.data(for: req)
             guard activeGenerationToken == myToken else { return }
             let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
+            updatePromptEnhancement(job)
 
             if job.status == "failed" {
                 stopLiveGenerationTimer()
@@ -1165,6 +1203,7 @@ final class IOSStudioViewModel: ObservableObject {
                 }
                 consecutiveErrors = 0
                 let job = try JSONDecoder().decode(ColabJobResponse.self, from: data)
+                updatePromptEnhancement(job)
                 if let tl = job.telemetry { applyLiveTelemetrySnapshot(tl) }
                 if job.status != "completed" {
                     progressValue = min(0.98, max(0.0, job.progress))

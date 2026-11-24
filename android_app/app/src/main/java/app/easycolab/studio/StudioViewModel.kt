@@ -239,6 +239,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     var taskModeId by mutableStateOf("t2va")
     var visualPrompt by mutableStateOf(PRESET_TEMPLATES[0].visual)
     var enhanceImagePrompt by mutableStateOf(false)
+    var expandedImagePrompt by mutableStateOf<String?>(null)
+        private set
+    var peStage by mutableStateOf<String?>(null)
+        private set
+    var peProgress by mutableStateOf<Float?>(null)
+        private set
     var negativePrompt by mutableStateOf("")
     var soundscapePrompt by mutableStateOf(PRESET_TEMPLATES[0].soundscape)
     var musicPrompt by mutableStateOf(PRESET_TEMPLATES[0].music)
@@ -949,6 +955,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     fun switchSelectedModel(spec: OpenModelSpec) {
         if (selectedModelId == spec.id) return
+        expandedImagePrompt = null
+        peStage = null
         selectedModelId = spec.id
         reportedReferenceLimit = null
         taskModeId = spec.modes[0].id
@@ -1434,7 +1442,9 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun cancelCurrentGeneration() {
-        activeGenerationToken = UUID.randomUUID().toString()
+        val stoppedJob = pendingJobId.takeIf { activeModelSpec.modality == ModelModality.IMAGE && expandedImagePrompt == null }
+        val cancelToken = UUID.randomUUID().toString()
+        activeGenerationToken = cancelToken
         pendingJobId = null
         stopLiveGenerationTimer()
         isGenerating = false
@@ -1443,11 +1453,33 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val base = normalizedBaseURL.takeIf { it.isNotEmpty() } ?: return
         viewModelScope.launch {
             try {
-                postJsonForStatus("$base/minimax_api/cancel", JSONObject(), timeoutSec = 12L)?.let(::applyStatusJson)
+                val status = postJsonForStatus("$base/minimax_api/cancel", JSONObject(), timeoutSec = 12L)
+                if (activeGenerationToken != cancelToken) return@launch
+                status?.let(::applyStatusJson)
             } catch (_: Exception) {
             }
+            if (activeGenerationToken != cancelToken) return@launch
             statusMessage = L("已停止当前生成任务。", "Stopped current generation job.")
+            if (stoppedJob != null) {
+                try {
+                    val job = withContext(Dispatchers.IO) {
+                        val req = Request.Builder().url("$base/minimax_api/job/$stoppedJob").build()
+                        apiClient.newCall(req).execute().use { resp ->
+                            if (resp.isSuccessful) JSONObject(resp.body?.string().orEmpty()) else null
+                        }
+                    }
+                    if (activeGenerationToken == cancelToken) job?.let(::updatePromptEnhancement)
+                } catch (_: Exception) {
+                }
+            }
         }
+    }
+
+    private fun updatePromptEnhancement(job: JSONObject) {
+        if (job.optString("model_id") != selectedModelId) return
+        peStage = job.optStringOrNull("pe_stage")
+        peProgress = job.optDoubleOrNull("pe_progress")?.toFloat()?.coerceIn(0f, 1f)
+        job.optStringOrNull("expanded_prompt")?.takeIf { it.isNotEmpty() }?.let { expandedImagePrompt = it }
     }
 
     internal fun bitmapToBase64Jpeg(bmp: Bitmap): String {
@@ -1497,6 +1529,10 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             val useReferenceArray = reportedReferenceLimit != null
             val myToken = UUID.randomUUID().toString()
             activeGenerationToken = myToken
+            expandedImagePrompt = null
+            peStage = null
+            peProgress = null
+            pendingJobId = null
             isGenerating = true
             progressValue = 0f
             currentJobElapsed = 0.0
@@ -1577,7 +1613,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
                 if (activeGenerationToken != myToken) return@launch
-
+                updatePromptEnhancement(jobJson)
                 val st = jobJson.optString("status", "")
                 val msg = jobJson.optString("message", "")
                 val jobId = jobJson.optString("job_id", "")
@@ -1642,6 +1678,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 consecutiveErrors = 0
                 val job = JSONObject(bodyStr)
+                updatePromptEnhancement(job)
                 job.optJSONObject("telemetry")?.let(::applyLiveTelemetryObject)
 
                 val st = job.optString("status", "")

@@ -20,6 +20,7 @@ import time
 import uuid
 import signal
 import argparse
+import subprocess
 import tempfile
 import threading
 import contextlib
@@ -701,7 +702,124 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
     return s
 
 
-def cmd_wake(gpu_type: str, app_py_path: str):
+_DRIVE_MOUNT_CHECK = """(
+    os.path.isdir("/content/drive/MyDrive")
+    and os.stat("/content/drive/MyDrive").st_dev != os.stat("/content").st_dev
+)"""
+
+
+def _google_drive_consent_url(uri):
+    try:
+        parts = urllib.parse.urlsplit(uri)
+        return (
+            isinstance(uri, str) and not any(c.isspace() or ord(c) < 32 for c in uri)
+            and parts.scheme == "https" and parts.hostname == "accounts.google.com"
+            and parts.username is None and parts.password is None and parts.port in (None, 443)
+            and parts.path in ("/o/oauth2/auth", "/o/oauth2/v2/auth")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _native_drive_worker(session_name, endpoint):
+    """Run the CLI's interactive DriveFS automation in an isolated child process."""
+    from colab_cli.commands import automation
+
+    # The CLI normally prints the OAuth URL, writes it into command history,
+    # then accepts any input (including EOF). Keep that output out of logs.
+    control = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
+    consent_input = sys.stdin
+    with open(os.devnull, "w") as sink:
+        os.dup2(sink.fileno(), sys.stdout.fileno())
+        os.dup2(sink.fileno(), sys.stderr.fileno())
+    class DriveEvents:
+        mounted = False
+        awaiting_consent = False
+
+        def log_event(self, name, event, data):
+            if event == "drive_auth_needed":
+                uri = data.get("uri")
+                if not _google_drive_consent_url(uri):
+                    self.abort_mount()
+                self.awaiting_consent = True
+                print("WAKE_DRIVE_AUTH:" + uri, file=control, flush=True)
+            elif event == "automation_result":
+                outputs = data.get("outputs", [])
+                self.mounted = (
+                    any("EASYCOLAB_DRIVE_MOUNTED" in item.get("text", "").splitlines() for item in outputs)
+                    and not any(item.get("output_type") == "error" for item in outputs)
+                )
+
+        def readline(self, *args):
+            import select
+            try:
+                approved = (
+                    self.awaiting_consent
+                    and select.select([consent_input], [], [], 540)[0]
+                    and consent_input.readline() == "DRIVE_GRANTED\n"
+                )
+            except (OSError, ValueError):
+                approved = False
+            if not approved:
+                self.abort_mount()
+            self.awaiting_consent = False
+            return "\n"
+
+        def abort_mount(self):
+            # The CLI hook runs on the websocket thread. Interrupt its pending
+            # mount request before exiting so another wake can use this kernel.
+            try:
+                runtime.kernel_client.interrupt(timeout=5)
+                saved = state.store.get(session_name)
+                if saved and saved.endpoint == endpoint and saved.running == "automation(drivemount)":
+                    saved.running = None
+                    state.store.add(saved)
+            finally:
+                os._exit(2)
+
+    events = DriveEvents()
+    state._history = events
+    sys.stdin = events  # The child has no controlling tty; the CLI reads this pipe instead.
+    current = state.get_session(session_name)
+    if current.endpoint != endpoint:
+        return 1
+    runtime = ColabRuntime(
+        current.url, current.token, session_name=session_name, history=events,
+        kernel_id=current.kernel_id, session_id=current.session_id,
+    )
+    # run_automation normally allocates its own extra kernel. Bind its native
+    # DriveFS callback to the very kernel the parent will use for deployment.
+    automation.ColabRuntime = lambda *args, **kwargs: runtime
+    code = (
+        "import os\n"
+        f"if not {_DRIVE_MOUNT_CHECK}:\n"
+        "    from google.colab import drive\n"
+        "    drive.mount('/content/drive')\n"
+        f"if {_DRIVE_MOUNT_CHECK}:\n"
+        "    print('EASYCOLAB_DRIVE_MOUNTED')"
+    )
+    automation.run_automation(session_name, "drivemount", code, allow_stdin=True, path="/content/drive", timeout=600)
+    return 0 if events.mounted else 1
+
+
+def _ensure_wake_drive(session):
+    print("WAKE_LOG: 正在检查此实例的 Google Drive 挂载…", flush=True)
+    try:
+        _resolve_or_start_remote_kernel(session)
+        result = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "_wake_drive", session.name, session.endpoint],
+            start_new_session=True, timeout=660,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Google Drive 挂载超时，请重新唤醒并完成 Google 授权。") from None
+    except Exception:
+        raise RuntimeError("无法在此实例连接 Google Drive，请重新唤醒并重试。") from None
+    if result.returncode != 0:
+        raise RuntimeError("未能验证 Google Drive 挂载。请重新唤醒并完成授权，或关闭「使用 Drive 权重」以使用临时存储。")
+    print("WAKE_LOG: 已验证 Google Drive 挂载，正在部署服务…", flush=True)
+
+
+def cmd_wake(gpu_type: str, app_py_path: str, require_drive: bool = False):
     """
     无浏览器一键唤醒 Colab GPU 并自动部署 EasyColab 多模型服务端：
     1. 全量云端分配对账：遍历账号下全部云端 assignments（含未在本地登记的孤儿实例），优先复用同型号健康实例，
@@ -805,6 +923,8 @@ def cmd_wake(gpu_type: str, app_py_path: str):
             if not _wait_for_runtime_ready(target_session, timeout_s=50):
                 print("WAKE_LOG: ⏳ 容器仍在初始化，继续尝试连接内核...", flush=True)
 
+        if require_drive:
+            _ensure_wake_drive(target_session)
         print("WAKE_LOG: 正在上传最新多模型开源服务端代码 (app.py)...", flush=True)
         contents = ContentsClient(target_session)
         for up_attempt in range(4):
@@ -817,7 +937,7 @@ def cmd_wake(gpu_type: str, app_py_path: str):
                 time.sleep(2.5)
 
         contents.upload(os.path.join(os.path.dirname(app_py_path), "runtime_auth.py"), "content/runtime_auth.py")
-        rclone_conf_text = _build_rclone_drive_conf()
+        rclone_conf_text = None if require_drive else _build_rclone_drive_conf()
         if rclone_conf_text:
             tmp_rc_fd, tmp_rc_path = tempfile.mkstemp(prefix="easycolab_rc_", suffix=".conf")
             try:
@@ -869,6 +989,8 @@ _native_drive_ok = (
     and os.path.exists("/content")
     and os.stat("/content/drive/MyDrive").st_dev != os.stat("/content").st_dev
 )
+if REQUIRE_DRIVE and not _native_drive_ok:
+    raise RuntimeError("Google Drive 挂载已断开，请重新唤醒并授权。")
 if not _native_drive_ok and os.path.exists(rc_existing):
     if not shutil.which("rclone"):
         subprocess.run(
@@ -985,6 +1107,7 @@ else:
                 code = (
                     "ADMIN_STAGE = " + repr("/content/" + stage) + "\n"
                     + "INITIAL_IDLE_MINUTES = " + repr(initial_idle_minutes) + "\n"
+                    + "REQUIRE_DRIVE = " + repr(require_drive) + "\n"
                     + boot_code
                 )
                 return rt.execute_code(code, allow_stdin=False, timeout=300)
@@ -1503,6 +1626,7 @@ def main(argv=None):
 
     p_wake = sub.add_parser("wake")
     p_wake.add_argument("--gpu", type=str, default="G4")
+    p_wake.add_argument("--require-drive", action="store_true", help="Require a verified Drive mount before deployment")
     p_wake.add_argument(
         "--app-py",
         type=str,
@@ -1523,7 +1647,7 @@ def main(argv=None):
     elif args.cmd == "auth_code":
         cmd_auth_code(args.code)
     elif args.cmd == "wake":
-        cmd_wake(args.gpu, args.app_py)
+        cmd_wake(args.gpu, args.app_py, require_drive=args.require_drive)
     elif args.cmd == "keepalive":
         cmd_keepalive()
     elif args.cmd == "keepalive_daemon":
@@ -1543,4 +1667,10 @@ def run_cli(argv=None):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "_wake_drive":
+        try:
+            mount_status = _native_drive_worker(sys.argv[2], sys.argv[3])
+        except Exception:
+            mount_status = 1
+        os._exit(mount_status)
     run_cli()

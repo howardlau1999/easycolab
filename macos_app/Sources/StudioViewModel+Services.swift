@@ -287,14 +287,38 @@ extension StudioViewModel {
     }
 
     func stopActiveWakeProcess() {
+        try? wakeInputPipe?.fileHandleForWriting.close()
+        wakeInputPipe = nil
+        wakeDriveConsentURL = nil
         if let proc = activeWakeProcess, proc.isRunning {
             proc.terminate()
         }
         activeWakeProcess = nil
+        isWakingColab = false
+    }
+
+    func confirmWakeDriveConsent() {
+        guard wakeDriveConsentURL != nil, let pipe = wakeInputPipe else { return }
+        do {
+            try pipe.fileHandleForWriting.write(contentsOf: Data("DRIVE_GRANTED\n".utf8))
+            wakeDriveConsentURL = nil
+            statusMessage = L("正在核验 Google Drive 挂载…", "Verifying the Google Drive mount…")
+        } catch {
+            stopActiveWakeProcess()
+            statusMessage = L("授权等待已结束，请重新唤醒实例。", "The authorization wait ended. Wake the instance again.")
+        }
     }
 
     func handleWakeOutputLine(_ line: String, gpu: String, password: String) {
-        if line.hasPrefix("WAKE_URL:") {
+        if line.hasPrefix("WAKE_DRIVE_AUTH:") {
+            let raw = String(line.dropFirst("WAKE_DRIVE_AUTH:".count))
+            guard let url = URL(string: raw),
+                  url.scheme == "https", url.host == "accounts.google.com",
+                  url.user == nil, url.password == nil, url.port == nil || url.port == 443,
+                  ["/o/oauth2/v2/auth", "/o/oauth2/auth"].contains(url.path) else { return }
+            wakeDriveConsentURL = url
+            statusMessage = L("请打开 Google 授权页，完成后点击「已授权，继续」。", "Open Google authorization, then confirm when finished.")
+        } else if line.hasPrefix("WAKE_URL:") {
             let url = String(line.dropFirst("WAKE_URL:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
             self.colabServerURL = url
             self.adminPassword = password
@@ -324,6 +348,7 @@ extension StudioViewModel {
     }
 
     func wakeColabHeadless() async {
+        guard !isWakingColab else { return }
         guard cliLoggedIn else {
             statusMessage = L("请先绑定 Google 账号后再使用免网页一键唤醒。", "Please bind your Google account before using headless 1-click wake.")
             return
@@ -356,7 +381,10 @@ extension StudioViewModel {
             "EASYCOLAB_ADMIN_PASSWORD": password,
             "EASYCOLAB_IDLE_TIMEOUT_MINUTES": "\(idleMin)"
         ]) { _, new in new }
-        proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
+        proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy] + (useDriveWeights ? ["--require-drive"] : [])
+        let input = Pipe()
+        proc.standardInput = input
+        wakeInputPipe = input
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
@@ -366,53 +394,33 @@ extension StudioViewModel {
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                    let data = handle.availableData
-                    guard !data.isEmpty else { return }
-                    let lines = lineBuffer.appendAndExtractLines(data)
+                func emit(_ lines: [String]) {
                     guard !lines.isEmpty else { return }
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.activeWakeProcess === proc else { return }
                         for line in lines {
                             self.handleWakeOutputLine(line, gpu: gpu, password: password)
                         }
                     }
                 }
-
                 do {
                     try proc.run()
+                    while true {
+                        let data = pipe.fileHandleForReading.availableData
+                        guard !data.isEmpty else { break }
+                        emit(lineBuffer.appendAndExtractLines(data))
+                    }
+                    if let line = lineBuffer.flushRemainingLine() { emit([line]) }
                     proc.waitUntilExit()
                 } catch {
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        self.statusMessage = L(
-                            "启动唤醒进程失败: \(error.localizedDescription)",
-                            "Failed to launch wake process: \(error.localizedDescription)"
-                        )
-                    }
+                    emit(["WAKE_ERROR: " + error.localizedDescription])
                 }
-                pipe.fileHandleForReading.readabilityHandler = nil
-                let tailData = pipe.fileHandleForReading.readDataToEndOfFile()
-                var finalLines = lineBuffer.appendAndExtractLines(tailData)
-                if let rem = lineBuffer.flushRemainingLine() {
-                    finalLines.append(rem)
-                }
-                let capturedFinal = finalLines
-                Task { @MainActor [weak self] in
-                    if let self {
-                        for line in capturedFinal {
-                            self.handleWakeOutputLine(line, gpu: gpu, password: password)
-                        }
-                    }
-                    continuation.resume()
-                }
+                DispatchQueue.main.async { continuation.resume() }
             }
         }
 
-        if self.activeWakeProcess === proc {
-            self.activeWakeProcess = nil
-        }
-        isWakingColab = false
+        guard self.activeWakeProcess === proc else { return }
+        stopActiveWakeProcess()
         await refreshOfficialColabAccountUsage()
         if wakeObtainedURLThisRun && !colabServerURL.isEmpty {
             await checkColabStatus()
@@ -555,8 +563,8 @@ extension StudioViewModel {
                 try? await Task.sleep(nanoseconds: 2_500_000_000)
                 tick += 1
                 if isConnected {
-                    // 生成任务进行中由 pollColabJob 附带 telemetry 实时更新图表，仅每 15s 低频同步一次全局状态，避免争抢 Gradio 隧道
-                    if !isGenerating || tick % 6 == 0 {
+                    // Byte counts come from status; sampling telemetry arrives separately with each job poll.
+                    if !isGenerating || imagePEJobProgress?.stage == .downloading || imagePEStatus?.downloading == true || tick % 6 == 0 {
                         await checkColabStatus(silent: true)
                     }
                     if cliLoggedIn && !isWakingColab {

@@ -208,6 +208,9 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         # ── Generation & Sampling State ──
         self.visual_prompt: str = PRESET_TEMPLATES[0].visual
         self.enhance_image_prompt: bool = False
+        self.expanded_image_prompt = ""
+        self.pe_stage: Optional[str] = None
+        self.pe_progress: Optional[float] = None
         self.edit_reference_limit: Optional[int] = None
         self.soundscape_prompt: str = PRESET_TEMPLATES[0].soundscape
         self.music_prompt: str = PRESET_TEMPLATES[0].music
@@ -233,6 +236,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.current_job_elapsed: float = 0.0
         self._job_start_local_ts: float = 0.0
         self._active_generation_token: str = ""
+        self._pe_job_id = ""
 
         # ── ComfyUI State ──
         self.comfy_running: bool = False
@@ -995,6 +999,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         spec = MODEL_SPEC_MAP[model_id]
         if model_id != self.selected_model_id:
             self.edit_reference_limit = None
+            self.expanded_image_prompt = ""
+            self.pe_stage = None
         self.selected_model_id = model_id
         if spec.modes:
             self.task_mode_id = spec.modes[0].id
@@ -1246,6 +1252,10 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         token = str(uuid.uuid4())
         self._active_generation_token = token
+        self._pe_job_id = ""
+        self.expanded_image_prompt = ""
+        self.pe_stage = None
+        self.pe_progress = None
         self.is_generating = True
         self.progress_value = 0.01
         self.current_job_elapsed = 0.0
@@ -1325,6 +1335,13 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     err_txt = r.text[:200]
                     raise RuntimeError(f"HTTP {r.status_code}: {err_txt}")
                 job = r.json()
+                job_id = str(job.get("job_id") or "")
+                if payload.get("enhance_prompt"):
+                    def on_pe_submitted() -> None:
+                        if self._active_generation_token == token:
+                            self._pe_job_id = job_id
+                            self._apply_prompt_enhancement(job)
+                    self._dispatch_ui(on_pe_submitted)
                 if job.get("status") == "failed":
                     msg = localize_server_text(
                         strip_emoji(str(job.get("message") or tr("任务提交失败", "Failed to submit job")))
@@ -1344,7 +1361,6 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     self._dispatch_ui(on_fail)
                     return
 
-                job_id = str(job.get("job_id") or "")
                 self._poll_colab_job(base, job_id, token, assistant_idx)
             except Exception as exc:
                 err_msg = tr(f"提交推理任务失败：{exc}", f"Failed to submit inference job: {exc}")
@@ -1484,6 +1500,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 if self._active_generation_token != token:
                     return
 
+                self._apply_prompt_enhancement(j)
                 if isinstance(j.get("telemetry"), dict):
                     self._apply_live_telemetry_snapshot(j["telemetry"])
 
@@ -1548,8 +1565,21 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             if status in {"completed", "failed"}:
                 return
 
+    def _apply_prompt_enhancement(self, job: dict) -> None:
+        if job.get("model_id") != self.selected_model_id:
+            return
+        self.pe_stage = job.get("pe_stage")
+        progress = job.get("pe_progress")
+        self.pe_progress = max(0.0, min(1.0, progress)) if type(progress) in (int, float) else None
+        prompt = job.get("expanded_prompt")
+        if isinstance(prompt, str) and prompt:
+            self.expanded_image_prompt = prompt
+
     def cancel_current_generation(self) -> None:
-        self._active_generation_token = str(uuid.uuid4())
+        stopped_job = self._pe_job_id if not self.expanded_image_prompt else ""
+        cancel_token = str(uuid.uuid4())
+        self._active_generation_token = cancel_token
+        self._pe_job_id = ""
         self.is_generating = False
         self.progress_value = 0.0
         self.status_message = tr(
@@ -1564,14 +1594,20 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         base = self.normalized_base_url
         if base:
-            threading.Thread(
-                target=lambda: self._safe_post_empty(f"{base}/minimax_api/cancel", timeout=12),
-                daemon=True,
-            ).start()
+            def cancel() -> None:
+                try:
+                    self._admin_request("POST", f"{base}/minimax_api/cancel", json={}, timeout=12)
+                    if stopped_job:
+                        response = self._admin_request("GET", f"{base}/minimax_api/job/{stopped_job}", timeout=12)
+                        response.raise_for_status()
+                        job = response.json()
 
-    def _safe_post_empty(self, url: str, timeout: int = 12) -> None:
-        try:
-            self._admin_request("POST", url, json={}, timeout=timeout)
-        except Exception:
-            pass
+                        def finish() -> None:
+                            if self._active_generation_token == cancel_token:
+                                self._apply_prompt_enhancement(job)
+                                self.state_changed.emit()
+                        self._dispatch_ui(finish)
+                except Exception:
+                    pass
+            threading.Thread(target=cancel, daemon=True).start()
 
