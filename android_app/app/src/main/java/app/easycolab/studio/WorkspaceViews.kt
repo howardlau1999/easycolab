@@ -1480,6 +1480,7 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
             if (vm.isGenerating) {
                 val stage = when (vm.peStage) {
                     "downloading" -> L("下载 PE 权重", "Downloading PE weights")
+                    "staging" -> L("从 Drive 复制到实例 SSD", "Copying PE weights from Drive to the runtime SSD")
                     "loading" -> L("加载 PE 模型", "Loading PE model")
                     "expanding" -> L("PE 增强提示词", "Expanding prompt")
                     else -> null

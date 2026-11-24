@@ -1004,6 +1004,7 @@ final class IOSStudioViewModel: ObservableObject {
     var peStageLabel: String? {
         switch peStage {
         case "downloading": return L("下载 PE 权重", "Downloading PE weights")
+        case "staging": return L("从 Drive 复制到实例 SSD", "Copying PE weights from Drive to the runtime SSD")
         case "loading": return L("加载 PE 模型", "Loading PE model")
         case "expanding": return L("PE 增强提示词", "Expanding prompt")
         default: return nil

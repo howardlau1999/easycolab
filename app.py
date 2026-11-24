@@ -1492,6 +1492,10 @@ IMAGE_PE_GGUF_REVISION = "fce97403ab2a34b62317bd7b37f380fecaef2565"
 IMAGE_PE_WEIGHT = "MiniMax-H3-Image-PE-NVFP4.gguf"
 IMAGE_PE_PROJECTOR = "MiniMax-H3-Image-PE.mmproj.gguf"
 IMAGE_PE_FILE_SIZES = {IMAGE_PE_WEIGHT: 17_010_708_032, IMAGE_PE_PROJECTOR: 931_146_464}
+IMAGE_PE_FILE_SHA256 = {
+    IMAGE_PE_WEIGHT: "3ac49e6543fd758a9b627f959ee670f40ccfcc14921104a6a1689a67548e0a26",
+    IMAGE_PE_PROJECTOR: "bcab0c946c368e1e0ff5585f8e4aa9f59b95cda20e483d42055b8476c922f913",
+}
 _IMAGE_PE_DOWNLOAD_LOCK = threading.Lock()
 _IMAGE_PE_DOWNLOADS: Dict[str, Future] = {}
 _IMAGE_PE_DOWNLOAD_BYTES: Dict[str, int] = {}
@@ -3492,6 +3496,7 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
         "api_key_enabled": True,
         "api_key_configured": API_AUTH_KEY != INITIAL_API_KEY,
         "api_request_count": API_REQUEST_COUNT,
+        "active_generation_count": len(_JOB_CANCEL_EVENTS),
         "console_lines": get_live_console_Lines(),
         "custom_models": _get_custom_models_public_list(),
     }
@@ -4041,6 +4046,146 @@ def _image_pe_weight_path(name: str) -> str:
     return destination
 
 
+def _image_pe_inference_path(persistent_path: str) -> str:
+    """Prefer an unchanged, pinned Hub download on local NVMe when Drive holds the durable copy."""
+    if not DRIVE_MOUNTED:
+        return persistent_path
+    from pathlib import Path
+
+    name = os.path.basename(persistent_path)
+    local = Path.cwd() / "models" / IMAGE_PE_GGUF_REPO / name
+    if not _image_pe_file_cached(str(local)):
+        return persistent_path
+    # Hub's local_dir sidecar contains the commit, LFS etag and verification timestamp.
+    # Apply Hub's one-second filesystem timestamp tolerance without reading the full GGUF.
+    sidecar = local.parent / ".cache" / "huggingface" / "download" / f"{name}.metadata"
+    try:
+        with sidecar.open(encoding="utf-8") as metadata:
+            commit = metadata.readline().strip()
+            etag = metadata.readline().strip()
+            timestamp = float(metadata.readline().strip())
+        if commit == IMAGE_PE_GGUF_REVISION and etag == IMAGE_PE_FILE_SHA256[name] and local.stat().st_mtime <= timestamp + 1:
+            return str(local)
+    except (OSError, ValueError):
+        pass
+    return persistent_path
+
+
+def _verified_image_pe_stage(path) -> bool:
+    try:
+        stat = path.stat()
+        expected = IMAGE_PE_FILE_SHA256[path.name]
+        stamp = (path.parent / "verified").read_text(encoding="ascii")
+        return stat.st_size == IMAGE_PE_FILE_SIZES[path.name] and stamp == f"{expected} {stat.st_ino} {stat.st_mtime_ns}"
+    except (OSError, ValueError):
+        return False
+
+
+def _stage_image_pe_file(source: str, target, reserve: int, cancel_event, report_bytes):
+    import errno
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
+
+    cache_root = target.parent.parent
+    check_cancelled()
+    with tempfile.TemporaryDirectory(prefix=".staging-", dir=cache_root) as temporary:
+        temp_dir = Path(temporary)
+        local = temp_dir / target.name
+        expected_size = IMAGE_PE_FILE_SIZES[target.name]
+        expected_sha = IMAGE_PE_FILE_SHA256[target.name]
+        digest = hashlib.sha256()
+        copied = 0
+        with open(source, "rb") as src, local.open("xb") as dst:
+            while True:
+                check_cancelled()
+                if shutil.disk_usage(cache_root).free < reserve + expected_size - copied:
+                    raise OSError(errno.ENOSPC, "本地 NVMe 剩余空间不足")
+                chunk = src.read(4 * 1024**2)
+                if not chunk:
+                    break
+                check_cancelled()
+                copied += len(chunk)
+                if copied > expected_size:
+                    raise ValueError(f"{target.name} 的 Drive 副本超过固定版本大小")
+                dst.write(chunk)
+                digest.update(chunk)
+                if copied < expected_size and report_bytes:
+                    report_bytes(copied)
+        if copied != expected_size or digest.hexdigest() != expected_sha:
+            raise ValueError(f"{target.name} 的 Drive 副本大小或 SHA-256 与固定版本不符")
+        stat = local.stat()
+        (temp_dir / "verified").write_text(f"{expected_sha} {stat.st_ino} {stat.st_mtime_ns}", encoding="ascii")
+        check_cancelled()
+        # Publish the verified file and its stamp together. An existing file or populated
+        # directory cannot be overwritten by this directory rename on local POSIX storage.
+        try:
+            temp_dir.rename(target.parent)
+        except OSError:
+            if not _verified_image_pe_stage(target):
+                raise
+        if report_bytes:
+            report_bytes(copied)
+
+
+def _prepare_image_pe_inference_paths(paths, cancel_event, on_stage, on_progress):
+    """Choose a verified NVMe copy per file and report bytes still read directly from Drive."""
+    if not DRIVE_MOUNTED:
+        return paths, 0
+    from pathlib import Path
+
+    cache_root = Path.cwd() / "models" / "_image_pe_cache" / IMAGE_PE_GGUF_REVISION
+    resolved = [_image_pe_inference_path(path) for path in paths]
+    reserve = 22 * 1024**3
+    pending = []
+    free = None
+    for idx, (source, chosen) in enumerate(zip(paths, resolved)):
+        if source != chosen:
+            continue
+        name = os.path.basename(source)
+        target = cache_root / IMAGE_PE_FILE_SHA256[name] / name
+        if _verified_image_pe_stage(target):
+            resolved[idx] = str(target)
+            continue
+        if target.parent.exists():
+            continue
+        if free is None:
+            try:
+                cache_root.mkdir(parents=True, exist_ok=True)
+                free = max(0, shutil.disk_usage(cache_root).free - reserve)
+            except OSError:
+                free = 0
+        size = IMAGE_PE_FILE_SIZES[name]
+        if free >= size:
+            pending.append((idx, target, size))
+            free -= size
+
+    if pending:
+        total = sum(size for _, _, size in pending)
+        completed = 0
+        if on_stage:
+            on_stage("正在从 Drive 顺序读取 PE 权重并校验至本地 NVMe...")
+        if on_progress:
+            on_progress("staging", 0.0)
+        for idx, target, size in pending:
+            try:
+                _stage_image_pe_file(
+                    paths[idx], target, reserve, cancel_event,
+                    (lambda count: on_progress("staging", (completed + count) / total)) if on_progress else None,
+                )
+            except OSError as exc:
+                print(f"[PE] 本地 NVMe 暂存不可用，继续读取 Drive: {exc}")
+                break
+            resolved[idx] = str(target)
+            completed += size
+    drive_bytes = sum(IMAGE_PE_FILE_SIZES[os.path.basename(path)] for path, chosen in zip(paths, resolved) if path == chosen)
+    return resolved, drive_bytes
+
+
 def _get_image_pe_status() -> Dict[str, Any]:
     if os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip():
         return {"mode": "remote", "weights_cached": False, "projector_cached": False, "downloading": False, "error": ""}
@@ -4301,6 +4446,8 @@ def expand_image_prompt(
                 raise GenerationAbortedError("已手动停止当前推理任务")
         transfer.result()
     check_cancelled()
+    paths, drive_bytes = _prepare_image_pe_inference_paths(paths, cancel_event, on_stage, on_progress)
+    check_cancelled()
     if on_stage:
         on_stage("正在加载 MiniMax-H3-Image-PE 到显存...")
     if on_progress:
@@ -4312,7 +4459,7 @@ def expand_image_prompt(
     image_max_tokens = pe_context // (2 * len(images)) if len(images) > 2 else None
     bundle = _start_qwen_gguf_server(
         paths[0], paths[1] if images else None, ctx_len=pe_context, cur_free_gb=free_gib,
-        image_max_tokens=image_max_tokens,
+        image_max_tokens=image_max_tokens, drive_load_bytes=drive_bytes,
         on_load_progress=(lambda value: on_progress("loading", value)) if on_progress else None,
         model_id="minimax_h3_image_pe", model_name=payload["model"], for_prompt_expansion=True, cancel_event=cancel_event,
     )
@@ -4692,11 +4839,11 @@ def _pick_free_local_port() -> int:
 
 def _gguf_load_fraction(line: str, stage_bytes: Dict[str, int]) -> Optional[float]:
     """Combine llama.cpp router load events using each GGUF file's size."""
-    prefix = "cmd_child_to_router:state:"
-    if not line.startswith(prefix) or not stage_bytes:
+    _, marker, body = line.rpartition("cmd_child_to_router:state:")
+    if not marker or not stage_bytes:
         return None
     try:
-        event = json.loads(line[len(prefix):])
+        event = json.loads(body)
     except ValueError:
         return None
     if not isinstance(event, dict) or event.get("state") != "loading":
@@ -4730,6 +4877,7 @@ def _start_qwen_gguf_server(
     cancel_event: Optional[threading.Event] = None,
     image_max_tokens: Optional[int] = None,
     on_load_progress: Optional[Callable[[float], None]] = None,
+    drive_load_bytes: int = 0,
 ) -> Dict[str, Any]:
     """
     启动驻留 GPU 的 llama-server 实例加载 GGUF 主模型 + 可选 mmproj 视觉投影器 + 可选 MTP 投机解码头。
@@ -4790,7 +4938,7 @@ def _start_qwen_gguf_server(
     opener = _make_noproxy_opener()
     last_err = ""
     stage_bytes = {}
-    if for_prompt_expansion and on_load_progress is not None:
+    if for_prompt_expansion:
         try:
             stage_bytes["text_model"] = os.path.getsize(gguf_path)
             if mmproj_path and os.path.exists(mmproj_path):
@@ -4800,6 +4948,10 @@ def _start_qwen_gguf_server(
         except OSError:
             stage_bytes.clear()
     previous_progress = None
+    # Older builds may expose no native progress while mmap faults in a cold Drive GGUF.
+    idle_timeout = 240.0
+    if for_prompt_expansion and drive_load_bytes > 0:
+        idle_timeout = min(75 * 60, idle_timeout + drive_load_bytes / (4 * 1024**2))
 
     for attempt_idx, (kv_type, ngl_val, use_mtp, moe_ot) in enumerate(attempts):
         if cancel_event is not None and cancel_event.is_set():
@@ -4893,11 +5045,15 @@ def _start_qwen_gguf_server(
                         ln = raw_line.rstrip("\r\n")
                         if not ln:
                             continue
-                        if stage_bytes and ln.startswith("cmd_child_to_router:"):
+                        if stage_bytes:
                             fraction = _gguf_load_fraction(ln, stage_bytes)
-                            if fraction is not None and fraction < 1:
-                                snapshot["fraction"] = fraction
-                            continue
+                            if fraction is not None:
+                                if fraction < 1:
+                                    snapshot["fraction"] = fraction
+                                # stderr can precede the router event without a newline.
+                                ln = ln.rpartition("cmd_child_to_router:state:")[0]
+                                if not ln:
+                                    continue
                         log_buf.append(ln)
                         if len(log_buf) > 100:
                             del log_buf[:25]
@@ -4905,22 +5061,28 @@ def _start_qwen_gguf_server(
                     pass
 
             threading.Thread(target=_drain_stdout, args=(proc, recent_logs, progress_snapshot), daemon=True).start()
-            if previous_progress is not None:
+            if previous_progress is not None and on_load_progress is not None:
                 on_load_progress(0.0)
-                previous_progress = 0.0
+            previous_progress = None
 
             health_url = f"http://127.0.0.1:{port}/health"
-            deadline = time.time() + 240.0
+            deadline = time.monotonic() + idle_timeout
             ready = False
-            while time.time() < deadline:
+            while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise GenerationAbortedError("已手动停止当前推理任务")
                 if proc.poll() is not None:
                     break
                 fraction = progress_snapshot.get("fraction")
                 if fraction is not None and (previous_progress is None or fraction > previous_progress):
-                    on_load_progress(fraction)
+                    if fraction > 0:
+                        # Cold Drive reads can take several minutes. Extend only on new loader progress.
+                        deadline = time.monotonic() + idle_timeout
+                    if on_load_progress is not None:
+                        on_load_progress(fraction)
                     previous_progress = fraction
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     with opener.open(health_url, timeout=2.0) as h_resp:
                         if h_resp.status == 200:
@@ -8567,6 +8729,9 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
         if failure:
             try:
                 _reclaim_transient_gpu_memory(trim_cpu=True)
+                # A terminal poll can be the client's last reading. Refresh the peak it saw during inference.
+                with contextlib.suppress(Exception):
+                    _sample_live_hardware_telemetry_once()
             finally:
                 JOBS[job_id].update(status="failed", message=failure)
     finally:
@@ -10655,9 +10820,7 @@ def attach_macos_api_routes(app: FastAPI):
                 old_ev = _JOB_CANCEL_EVENTS.get(old_jid)
                 if old_ev is not None:
                     old_ev.set()
-                old_j["status"] = "failed"
-                old_j["progress"] = 0.0
-                old_j["message"] = "已被新提交任务接替中断"
+                old_j["message"] = "正在停止上一项任务并释放资源，新任务将等待 GPU。"
         with CONSOLE_LOCK:
             ACTIVE_TQDM_BARS.clear()
 

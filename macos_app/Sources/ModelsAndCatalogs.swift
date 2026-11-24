@@ -908,7 +908,7 @@ struct ColabJobResponse: Codable {
 
 struct ImagePEJobProgress: Equatable {
     enum Stage: String {
-        case downloading, loading, expanding
+        case downloading, staging, loading, expanding
     }
 
     let stage: Stage
@@ -924,6 +924,7 @@ struct ImagePEJobProgress: Equatable {
     var title: String {
         switch stage {
         case .downloading: return L("正在下载 PE 权重", "Downloading PE weights")
+        case .staging: return L("正在从 Drive 复制到实例 SSD", "Copying PE weights from Drive to the runtime SSD")
         case .loading: return L("正在加载 PE 模型", "Loading the PE model")
         case .expanding: return L("正在增强提示词", "Expanding the prompt")
         }

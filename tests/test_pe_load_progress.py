@@ -82,7 +82,7 @@ class PELoadProgressTest(unittest.TestCase):
         self.cancel = threading.Event()
         self.env = {
             "os": os, "json": json, "threading": threading, "urllib": urllib,
-            "contextlib": contextlib, "time": SimpleNamespace(time=iter(range(2000)).__next__, sleep=lambda _: None),
+            "contextlib": contextlib, "time": SimpleNamespace(monotonic=iter(range(2000)).__next__, sleep=lambda _: None),
             "subprocess": SimpleNamespace(Popen=self.spawn, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT,
                                           TimeoutExpired=subprocess.TimeoutExpired),
             "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
@@ -98,7 +98,7 @@ class PELoadProgressTest(unittest.TestCase):
         self.addCleanup(proc.lines.put, None)
         return proc
 
-    def start(self, is_pe=True):
+    def start(self, is_pe=True, report_progress=True, drive_bytes=0):
         def record(value):
             self.assertIs(threading.current_thread(), threading.main_thread())
             if value == 1:
@@ -107,7 +107,7 @@ class PELoadProgressTest(unittest.TestCase):
 
         return self.env["_start_qwen_gguf_server"](
             str(self.model), str(self.projector), 2048, 24, for_prompt_expansion=is_pe,
-            cancel_event=self.cancel, on_load_progress=record,
+            cancel_event=self.cancel, on_load_progress=record if report_progress else None, drive_load_bytes=drive_bytes,
         )
 
     def response(self, status):
@@ -120,8 +120,10 @@ class PELoadProgressTest(unittest.TestCase):
         self.assertAlmostEqual(parse(router_event(0.5), sizes), 0.4)
         self.assertAlmostEqual(parse(router_event(0.5, "mmproj_model"), sizes), 0.9)
         self.assertAlmostEqual(parse(router_event(0.25, stages=["text_model"]), {"text_model": 80}), 0.25)
+        self.assertAlmostEqual(parse("load_tensors: ....." + router_event(0.75), sizes), 0.6)
         for line in [
             "loading tensors 84%", "cmd_child_to_router:state:not JSON",
+            "stderr mentions cmd_child_to_router:state: without a payload", router_event(0.5) + "trailing text",
             'cmd_child_to_router:state:{"state":"ready","payload":{}}',
             'cmd_child_to_router:state:{"state":"loading","payload":{"stage":"mmproj_model"}}',
             router_event(0.5, "other"), router_event(0.5, stages=["text_model"]),
@@ -129,6 +131,18 @@ class PELoadProgressTest(unittest.TestCase):
         ]:
             with self.subTest(line=line):
                 self.assertIsNone(parse(line, sizes))
+
+        def failed_startup(*_args, **_kwargs):
+            proc = self.children[-1]
+            proc.emit("partial stderr message..." + router_event(0.75))
+            proc.emit("normal diagnostic line")
+            proc.returncode = 1
+            return self.response(503)
+
+        self.opener.open.side_effect = failed_startup
+        with self.assertRaisesRegex(RuntimeError, r"partial stderr message\.\.\.\nnormal diagnostic line") as failure:
+            self.start()
+        self.assertNotIn("cmd_child_to_router", str(failure.exception))
 
     def test_partial_load_then_retry_drops_late_output_and_gates_completion_on_health(self):
         events = iter(["first", "fail", "retry", "final", "wait", "ready"])
@@ -170,6 +184,54 @@ class PELoadProgressTest(unittest.TestCase):
         self.assertEqual(self.progress, [])
         self.assertTrue(self.children[0].stdin.closed)
         self.assertIsNotNone(self.children[0].returncode)
+
+    def test_cold_load_with_advancing_events_outlasts_four_minutes_without_ui_callback(self):
+        now = [0]
+        self.env["time"].monotonic = lambda: now[0]
+        def health(*_args, **_kwargs):
+            now[0] += 110
+            self.children[0].emit(router_event(min(1.0, now[0] / 600)))
+            return self.response(200 if now[0] >= 550 else 503)
+
+        self.opener.open.side_effect = health
+        bundle = self.start(report_progress=False)
+        self.addCleanup(self.env["_stop_gguf_server_bundle"], bundle)
+        self.assertEqual(len(self.children), 1)
+        self.assertGreater(now[0], 240)
+
+    def test_silent_or_stalled_loader_still_times_out(self):
+        for signal in (None, router_event(0.1)):
+            with self.subTest(signal=signal):
+                now = [0]
+                self.env["time"].monotonic = lambda: now[0]
+                def health(*_args, **_kwargs):
+                    now[0] += 90
+                    if signal:
+                        self.children[-1].emit(signal)
+                    return self.response(503)
+                self.opener.open.side_effect = health
+                with self.assertRaisesRegex(RuntimeError, "启动超时"):
+                    self.start()
+                self.assertLessEqual(now[0], 720)
+
+    def test_direct_drive_has_a_bounded_grace_period_for_silent_mmap(self):
+        now = [0]
+        self.env["time"].monotonic = lambda: now[0]
+        def health(*_args, **_kwargs):
+            now[0] += 90
+            return self.response(200 if now[0] >= 600 else 503)
+        self.opener.open.side_effect = health
+        bundle = self.start(report_progress=False, drive_bytes=2 * 1024**3)
+        self.addCleanup(self.env["_stop_gguf_server_bundle"], bundle)
+        self.assertEqual(len(self.children), 1)
+        def stalled(*_args, **_kwargs):
+            now[0] += 300
+            return self.response(503)
+        now[0] = 0
+        self.opener.open.side_effect = stalled
+        with self.assertRaisesRegex(RuntimeError, "启动超时"):
+            self.start(report_progress=False, drive_bytes=500 * 1024**3)
+        self.assertEqual(now[0], 2 * 75 * 60)
 
     def test_regular_qwen_keeps_standalone_process_and_ignores_pe_callback(self):
         self.opener.open.return_value = self.response(200)

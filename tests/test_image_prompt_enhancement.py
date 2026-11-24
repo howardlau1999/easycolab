@@ -69,7 +69,7 @@ class ImagePromptEnhancementTest(unittest.TestCase):
         self.engine = "qwen_image_21"
         self.env = {
             "BaseModel": SimpleNamespace, "JSONResponse": SimpleNamespace,
-            "threading": threading, "os": os, "time": time, "datetime": datetime,
+            "threading": threading, "os": os, "time": time, "datetime": datetime, "contextlib": contextlib,
             "base64": base64, "io": io, "torch": Mock(),
             "touch_activity": Mock(), "_verify_external_api_auth": Mock(return_value=None),
             "_JOB_CANCEL_EVENTS": {}, "ABORT_GENERATION_EVENT": threading.Event(),
@@ -81,6 +81,7 @@ class ImagePromptEnhancementTest(unittest.TestCase):
             "decode_base64_image": lambda data: data or None, "Image": SimpleNamespace(DecompressionBombError=RuntimeError),
             "_refresh_drive_mount_state": Mock(), "DEFAULT_OUTPUT_DIR": self.temp.name,
             "_reclaim_transient_gpu_memory": Mock(), "_pipeline_job_execution_guard": lambda **kw: nullcontext(),
+            "_sample_live_hardware_telemetry_once": Mock(),
             "_persist_generated_output_to_drive": lambda path: path,
             "expand_image_prompt": self.expand, "API_REQUEST_COUNT": 0,
         }
@@ -166,6 +167,7 @@ class ImagePromptEnhancementTest(unittest.TestCase):
         self.assertEqual(self.job["status"], "failed")
         self.assertEqual(self.job["expanded_prompt"], EXPANDED)
         self.env["_reclaim_transient_gpu_memory"].assert_called_with(trim_cpu=True)
+        self.env["_sample_live_hardware_telemetry_once"].assert_called_once()
         self.assertFalse(self.env["_JOB_CANCEL_EVENTS"])
 
     def test_api_rejects_overflow_before_superseding_an_active_job(self):
@@ -181,6 +183,22 @@ class ImagePromptEnhancementTest(unittest.TestCase):
             self.env["api_generate"](request)
         self.assertEqual(raised.exception.status_code, 422)
         self.assertEqual(self.job["status"], "running")
+
+    def test_superseded_task_stays_active_until_its_worker_releases_resources(self):
+        self.job.update(status="running", progress=0.4)
+        old_event = threading.Event()
+        self.env["_JOB_CANCEL_EVENTS"]["job"] = old_event
+        self.env.update(
+            _normalize_builtin_model_alias=lambda value: value,
+            uuid=SimpleNamespace(uuid4=lambda: SimpleNamespace(hex="nextjob")),
+            threading=SimpleNamespace(Thread=Mock(), Event=threading.Event),
+        )
+        req = self.env["GenerateVideoRequest"](model_id=self.engine, visual_prompt=ORIGINAL)
+        new_job = self.env["api_generate"](req)
+        self.assertTrue(old_event.is_set())
+        self.assertEqual(self.job["status"], "running")
+        self.assertIn("正在停止", self.job["message"])
+        self.assertEqual(new_job["status"], "queued")
 
     def test_minimax_edit_passes_sixteen_references_to_pe_and_generator(self):
         self.env["MODEL_CATALOG"][self.engine]["pipeline_arch"] = "minimax_h3_image"
@@ -253,7 +271,7 @@ class PromptExpansionBackendTest(unittest.TestCase):
     def setUpClass(cls):
         cls.app_code = load_app_code(
             "_build_image_pe_request", "_image_pe_prompt_directory", "IMAGE_PE_TEMPLATE_BLOBS",
-            "IMAGE_PE_TEMPLATE_REVISION", "_request_image_pe_caption", "expand_image_prompt",
+            "IMAGE_PE_TEMPLATE_REVISION", "_request_image_pe_caption", "expand_image_prompt", "_prepare_image_pe_inference_paths",
         )
 
     def setUp(self):
@@ -496,7 +514,8 @@ class ImagePEWeightDownloadTest(unittest.TestCase):
     def setUpClass(cls):
         cls.app_code = load_app_code(
             "_queue_image_pe_weights", "_download_image_pe_file", "_get_image_pe_status",
-            "_image_pe_weight_path", "_image_pe_file_cached", "_image_pe_progress_bar", "_image_pe_download_fraction",
+            "_image_pe_weight_path", "_image_pe_inference_path", "_image_pe_file_cached", "_image_pe_progress_bar", "_image_pe_download_fraction",
+            "_prepare_image_pe_inference_paths", "_stage_image_pe_file", "_verified_image_pe_stage",
             "DownloadImagePERequest", "api_download_image_pe",
         )
 
@@ -513,7 +532,7 @@ class ImagePEWeightDownloadTest(unittest.TestCase):
             "MODEL_BASE_ROOT": str(self.root), "IMAGE_PE_GGUF_REPO": "pe", "IMAGE_PE_GGUF_REVISION": "revision",
             "_IMAGE_PE_DOWNLOAD_LOCK": threading.Lock(), "_IMAGE_PE_DOWNLOADS": {}, "_IMAGE_PE_ERRORS": {},
             "_IMAGE_PE_DOWNLOAD_BYTES": {},
-            "DRIVE_MOUNTED": False,
+            "DRIVE_MOUNTED": False, "shutil": Mock(), "GenerationAbortedError": type("GenerationAbortedError", (RuntimeError,), {}),
             "_refresh_drive_mount_state": Mock(), "touch_activity": Mock(), "SELECTED_MODEL_ID": "generator",
             "get_gpu_status_dict": lambda **kw: {"image_pe": self.env["_get_image_pe_status"]()},
         }
@@ -576,6 +595,103 @@ class ImagePEWeightDownloadTest(unittest.TestCase):
         self.assertEqual(pending, [])
         self.assertTrue(self.env["_get_image_pe_status"]()["weights_cached"])
         self.hub.hf_hub_download.assert_not_called()
+
+    def test_pinned_local_replica_is_used_for_inference_only(self):
+        self.env.update(DRIVE_MOUNTED=True, LEGACY_DRIVE_MODEL_ROOTS=[], IMAGE_PE_FILE_SHA256={"weights": "a" * 64})
+        drive = self.root / "pe" / "weights"
+        drive.parent.mkdir()
+        drive.write_bytes(b"weights")
+        local = self.root / "models" / "pe" / "weights"
+        metadata = local.parent / ".cache" / "huggingface" / "download" / "weights.metadata"
+        metadata.parent.mkdir(parents=True)
+        read_path = self.env["_image_pe_inference_path"]
+        with patch("os.getcwd", return_value=str(self.root)):
+            self.assertEqual(read_path(str(drive)), str(drive))
+            local.write_bytes(b"weights")
+            fresh = str(local.stat().st_mtime + 1)
+            for revision, digest, timestamp in (
+                ("old", "a"*64, fresh), ("revision", "b"*64, fresh), ("revision", "a"*64, "0"),
+                ("revision", "a"*64, "incomplete sidecar"),
+            ):
+                metadata.write_text(f"{revision}\n{digest}\n{timestamp}\n")
+                self.assertEqual(read_path(str(drive)), str(drive))
+            metadata.write_text(f"revision\n{'a' * 64}\n{fresh}\n")
+            self.assertEqual(read_path(str(drive)), str(local))
+            self.assertEqual(self.env["_queue_image_pe_weights"](False), ([str(drive)], []))
+            self.assertTrue(self.env["_get_image_pe_status"]()["weights_cached"])
+            local.write_bytes(b"short")
+            self.assertEqual(read_path(str(drive)), str(drive))
+        self.hub.hf_hub_download.assert_not_called()
+
+    def drive_sources(self, data_by_name):
+        self.env.update(
+            DRIVE_MOUNTED=True, LEGACY_DRIVE_MODEL_ROOTS=[],
+            IMAGE_PE_FILE_SHA256={name: hashlib.sha256(data).hexdigest() for name, data in data_by_name.items()},
+            IMAGE_PE_FILE_SIZES={name: len(data) for name, data in data_by_name.items()},
+        )
+        self.env["shutil"].disk_usage.return_value.free = 40 * 1024**3
+        sources = []
+        for name, data in data_by_name.items():
+            source = self.root / "drive" / name
+            source.parent.mkdir(exist_ok=True)
+            source.write_bytes(data)
+            sources.append(str(source))
+        cwd = patch("os.getcwd", return_value=str(self.root))
+        cwd.start()
+        self.addCleanup(cwd.stop)
+        return sources
+
+    def test_staging_reports_actual_bytes_and_reuses_only_the_committed_cache(self):
+        chunk = 4 * 1024**2
+        sources = self.drive_sources({"weights": b"x" * (chunk + 13), "projector": b"vision"})
+        total = chunk + 19
+        progress = []
+        stages = []
+        prepare = self.env["_prepare_image_pe_inference_paths"]
+        chosen, remaining = prepare(sources, None, stages.append, lambda stage, fraction: progress.append((stage, fraction)))
+        self.assertEqual(remaining, 0)
+        self.assertEqual(progress, [("staging", n / total) for n in (0, chunk, chunk + 13, total)])
+        self.assertEqual(len(stages), 1)
+        for local, src in zip(chosen, sources):
+            self.assertEqual(Path(local).read_bytes(), Path(src).read_bytes())
+            self.assertTrue(self.env["_verified_image_pe_stage"](Path(local)))
+        self.env["_stage_image_pe_file"] = Mock(side_effect=AssertionError("Cache was not reused"))
+        no_progress = Mock()
+        self.assertEqual(prepare(sources, None, None, no_progress), (chosen, 0))
+        no_progress.assert_not_called()
+        self.env["shutil"].disk_usage.assert_called()
+
+    def test_cancel_or_corrupt_file_leaves_no_partially_staged_cache(self):
+        sources = self.drive_sources({"weights": b"x" * (4 * 1024**2 + 1)})
+        cancelled = threading.Event()
+        def stop_after_bytes(stage, progress):
+            if progress > 0:
+                cancelled.set()
+        prepare = self.env["_prepare_image_pe_inference_paths"]
+        with self.assertRaises(self.env["GenerationAbortedError"]):
+            prepare(sources, cancelled, None, stop_after_bytes)
+        cache = self.root / "models/_image_pe_cache/revision"
+        self.assertEqual(list(cache.iterdir()), [])
+        with open(sources[0], "r+b") as src:
+            src.write(b"!")
+        with self.assertRaisesRegex(ValueError, "SHA-256"):
+            prepare(sources, None, None, None)
+        self.assertEqual(list(cache.iterdir()), [])
+
+    def test_low_disk_and_unrecognized_entries_fall_back_to_drive_per_file(self):
+        sources = self.drive_sources({"weights": b"weights", "projector": b"lens"})
+        self.env["shutil"].disk_usage.return_value.free = 22 * 1024**3 + 4
+        prepare = self.env["_prepare_image_pe_inference_paths"]
+        chosen, remaining = prepare(sources, None, None, None)
+        self.assertEqual(chosen[0], sources[0])
+        self.assertNotEqual(chosen[1], sources[1])
+        self.assertEqual(remaining, 7)
+        foreign = self.root / "models/_image_pe_cache/revision" / self.env["IMAGE_PE_FILE_SHA256"]["weights"] / "weights"
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"unknown")
+        self.env["shutil"].disk_usage.return_value.free = 40 * 1024**3
+        self.assertEqual(prepare(sources, None, None, None), (chosen, 7))
+        self.assertEqual(foreign.read_bytes(), b"unknown")
 
     def test_download_bytes_follow_file_reconstruction_and_cached_dependencies(self):
         class BaseBar:
