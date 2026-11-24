@@ -37,7 +37,21 @@ Drive 无浏览器挂载仍可能将带有 Colab 和 Cloud Platform 授权的 Go
      - 支持最高 `256K` 上下文、长思维链推理、多模态看图反推提示词。
      - 内置兼容 **OpenAI (`/v1/chat/completions`)** 与 **Anthropic (`/v1/messages`)** 的公网 API 网关（支持 Bearer / `x-api-key` 鉴权），可直接接入 **Claude Code**、**Cursor** 等开发工具。
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K 海报生图与多图指令修图**
-     - 支持高质感中英文排版直出、双图自然语言指令修图与 8 步极速出图；所有生成的 MP4 / PNG 自动回传至本地目录（macOS: `~/Movies/EasyColab`，Windows: `%USERPROFILE%\Videos\EasyColab`，Linux: `~/Videos/EasyColab`）。
+     - 支持高质感中英文排版直出、多图自然语言指令修图与 8 步极速出图；所有生成的 MP4 / PNG 自动回传至本地目录（macOS: `~/Movies/EasyColab`，Windows: `%USERPROFILE%\Videos\EasyColab`，Linux: `~/Videos/EasyColab`）。
+
+### 生图指令增强
+
+在生图工作区选择模型，按模型管理区的提示下载并加载生图模型。在提示词旁勾选「使用 MiniMax-H3-Image-PE 增强提示词」即可启用扩写。文生图会先扩写描述，修图会结合参考图扩写编辑指令。每批只扩写一次，沿用选定的输出尺寸。开关默认关闭。
+
+在图像编辑模式中，MiniMax-H3-Image 最多支持 16 张参考图，Qwen-Image-2.1 最多 10 张，Z-Image-Turbo 支持 1 张。开启 PE 时，它会按界面顺序读取每张图的内容，结合编辑指令和输出宽高比扩写提示词，再把扩写结果和同一组参考图交给生图模型。使用 MiniMax 时，可以写「保留 `<Picture 1>` 中的人物，换上 `<Picture 2>` 的外套，背景参考 `<Picture 3>`」。[MiniMax 模型说明](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) · [Qwen 模型说明](https://huggingface.co/Qwen/Qwen-Image-2.1)
+
+勾选开关后，Mac 客户端会显示 Colab 是否已缓存 PE 权重。文生图需要约 17 GB 的主模型，参考图编辑另需约 931 MB 的视觉投影文件。可以提前点击下载，也可以直接生成，让 Colab 自动补齐缺少的文件。
+
+开始生成后，Colab 自动将 PE 加载到显存。提示词增强完成后，Colab 释放 PE，再用选定的生图模型采样。下次生成可复用已下载的权重。[MiniMax 官方模型与提示词](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) · [GGUF 转换权重](https://huggingface.co/prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF)
+
+已有 SGLang 部署时，可在启动 EasyColab 服务端前设置 `EASYCOLAB_IMAGE_PE_BASE_URL`（例如 `http://127.0.0.1:30000/v1`），并使用官方服务名 `MiniMax-H3-Image-PE`。此时提示词和修图参考图会发送到该服务，EasyColab 仅需下载官方提示词模板与请求参数。
+
+`POST /v1/images/generations` 支持布尔字段 `"enhance_prompt": true`。在 `model` 中填写生图模型，响应中每张图的 `revised_prompt` 是实际用于生成的提示词。
 
 ---
 

@@ -532,7 +532,8 @@ extension IOSStudioViewModel {
 
     func checkColabStatus(silent: Bool = false) async {
         let base = normalizedBaseURL
-        guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/status?model_id=\(selectedModelId)") else {
+        let modelID = selectedModelId
+        guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/status?model_id=\(modelID)") else {
             if !silent {
                 statusMessage = L("请先绑定账号一键唤醒，或填入 gradio.live 服务地址。", "Bind Google account to wake G4, or enter a gradio.live URL.")
             }
@@ -546,6 +547,7 @@ extension IOSStudioViewModel {
             var req = URLRequest(url: url)
             req.timeoutInterval = isGenerating ? 28 : 20
             let (data, resp) = try await URLSession.shared.data(for: req)
+            guard base == normalizedBaseURL, modelID == selectedModelId else { return }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else {
                 consecutiveStatusFailures += 1
@@ -556,6 +558,7 @@ extension IOSStudioViewModel {
             }
             consecutiveStatusFailures = 0
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            updateEditReferenceLimit(decoded)
             applyStatusResponse(decoded)
             if !silent {
                 showToast(L("已连接 \(gpuName)", "Connected to \(gpuName)"))

@@ -635,6 +635,9 @@ extension StudioViewModel {
     }
 
     func applyStatusResponse(_ decoded: ColabStatusResponse) {
+        if decoded.selected_model_id == selectedModelId {
+            serverEditReferenceLimit = decoded.edit_reference_limit.flatMap { $0 > 0 ? $0 : nil }
+        }
         isConnected = true
         gpuName = decoded.gpu_name ?? "Colab GPU"
         vramFreeGB = decoded.vram_free_gb ?? 0.0

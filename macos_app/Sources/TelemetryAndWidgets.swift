@@ -523,6 +523,127 @@ struct FrameDropWell: View {
 }
 
 
+struct EditReferencePicker: View {
+    @Binding var images: [NSImage]
+    @Binding var importing: Bool
+    let limit: Int
+    @State private var targeted = false
+    @State private var importError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !images.isEmpty {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 100, maximum: 150))], alignment: .leading) {
+                    ForEach(Array(images.enumerated()), id: \.offset) { index, image in
+                        VStack(spacing: 4) {
+                            Image(nsImage: image)
+                                .resizable().scaledToFit().frame(height: 68)
+                                .accessibilityLabel(L("参考图 \(index + 1)", "Reference \(index + 1)"))
+                            HStack(spacing: 5) {
+                                Text("\(index + 1)").monospacedDigit()
+                                Spacer()
+                                Button { images.swapAt(index, index - 1) } label: { Image(systemName: "chevron.left") }
+                                    .disabled(index == 0)
+                                    .help(L("前移", "Move earlier"))
+                                Button { images.swapAt(index, index + 1) } label: { Image(systemName: "chevron.right") }
+                                    .disabled(index == images.count - 1)
+                                    .help(L("后移", "Move later"))
+                                Button { images.remove(at: index); importError = nil } label: { Image(systemName: "xmark.circle") }
+                                    .help(L("移除", "Remove"))
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                        }
+                        .padding(6)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                Button(L("添加参考图…", "Add References…")) {
+                    let panel = NSOpenPanel()
+                    panel.allowedContentTypes = [.image]
+                    panel.allowsMultipleSelection = limit > 1
+                    if panel.runModal() == .OK, accepts(panel.urls.count) {
+                        append(panel.urls.map { NSImage(contentsOf: $0) })
+                    }
+                }
+                PasteButton(supportedContentTypes: [.fileURL, .image]) { providers in
+                    _ = importProviders(providers)
+                }
+                if importing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text(L("或拖入图片", "or drop images here")).foregroundStyle(.secondary)
+                }
+            }
+            .controlSize(.small)
+            .disabled(importing || images.count >= limit)
+            if images.count > limit {
+                Text(L("请移除 \(images.count - limit) 张图片后生成。", "Remove \(images.count - limit) images before generating."))
+                    .font(.caption).foregroundStyle(.orange)
+            } else if let importError {
+                Text(importError).font(.caption).foregroundStyle(.orange)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(targeted ? Color.accentColor : .clear))
+        .onDrop(of: [.fileURL, .image], isTargeted: $targeted, perform: importProviders)
+    }
+
+    private func accepts(_ count: Int) -> Bool {
+        guard images.count + count <= limit else {
+            importError = L("本次最多还可添加 \(max(0, limit - images.count)) 张参考图。",
+                            "You can add up to \(max(0, limit - images.count)) more references.")
+            return false
+        }
+        return true
+    }
+
+    private func append(_ batch: [NSImage?]) {
+        let valid = batch.compactMap { $0 }
+        guard valid.count == batch.count else {
+            importError = L("部分图片无法读取，请重新选择。", "Some images could not be read. Please select them again.")
+            return
+        }
+        images.append(contentsOf: valid)
+        importError = nil
+    }
+
+    private func importProviders(_ providers: [NSItemProvider]) -> Bool {
+        guard !providers.isEmpty, !importing, accepts(providers.count) else { return false }
+        importing = true
+        Task { @MainActor in
+            defer { importing = false }
+            var batch: [NSImage?] = []
+            for provider in providers {
+                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                    let url: URL? = await withCheckedContinuation { continuation in
+                        _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+                    }
+                    batch.append(url.flatMap { NSImage(contentsOf: $0) })
+                } else if let imageType = provider.registeredTypeIdentifiers.first(where: {
+                    UTType($0)?.conforms(to: .image) == true
+                }) {
+                    let data: Data? = await withCheckedContinuation { continuation in
+                        provider.loadDataRepresentation(forTypeIdentifier: imageType) { data, _ in
+                            continuation.resume(returning: data)
+                        }
+                    }
+                    batch.append(data.flatMap { NSImage(data: $0) })
+                } else {
+                    batch.append(nil)
+                }
+            }
+            append(batch)
+        }
+        return true
+    }
+}
+
+
 // MARK: - 通用 UI 容器组件
 
 struct SidebarCard<Content: View>: View {

@@ -68,6 +68,10 @@ func localizeServerText(_ text: String) -> String {
     guard LanguageManager.shared.isEN, !text.isEmpty else { return text }
 
     let exactMap: [String: String] = [
+        "正在准备 MiniMax-H3-Image-PE 提示词模板...": "Preparing MiniMax-H3-Image-PE prompt templates...",
+        "正在下载 MiniMax-H3-Image-PE 所需权重...": "Downloading MiniMax-H3-Image-PE weights...",
+        "正在加载 MiniMax-H3-Image-PE 到显存...": "Loading MiniMax-H3-Image-PE into GPU memory...",
+        "MiniMax-H3-Image-PE 正在增强提示词...": "Expanding the prompt with MiniMax-H3-Image-PE...",
         "未加载": "Not Loaded",
         "未连接 Colab 服务端": "Colab Server Disconnected",
         "尚未启动云端 ComfyUI 工作台": "Cloud ComfyUI Studio Not Started",

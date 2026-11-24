@@ -8,6 +8,7 @@ struct CreateTabView: View {
     @ObservedObject var langMgr = LanguageManager.shared
     @ObservedObject var kbObserver = IOSKeyboardObserver.shared
     @State private var firstPickerItem: PhotosPickerItem? = nil
+    @State private var editPickerItems: [PhotosPickerItem] = []
     @State private var lastPickerItem: PhotosPickerItem? = nil
     @State private var showAdvancedParams: Bool = false
     @State private var showWeightShards: Bool = false
@@ -445,16 +446,18 @@ struct CreateTabView: View {
                 }
 
                 // Reference Keyframe / Edit Photo Pickers
-                if ["fl2va", "i2i_edit"].contains(vm.taskModeId) {
+                if vm.taskModeId == "i2i_edit" {
+                    editReferencePicker
+                } else if vm.taskModeId == "fl2va" {
                     HStack(spacing: 10) {
                         photoSlotView(
-                            title: vm.taskModeId == "fl2va" ? L("首帧参考图", "Start Frame") : L("参考原图 1", "Source Photo 1"),
+                            title: L("首帧参考图", "Start Frame"),
                             image: vm.firstFrameImage,
                             selection: $firstPickerItem,
                             onClear: { vm.firstFrameImage = nil; firstPickerItem = nil }
                         )
                         photoSlotView(
-                            title: vm.taskModeId == "fl2va" ? L("尾帧参考图 (可选)", "End Frame (Opt)") : L("融合参考图 2 (可选)", "Photo 2 (Opt)"),
+                            title: L("尾帧参考图 (可选)", "End Frame (Opt)"),
                             image: vm.lastFrameImage,
                             selection: $lastPickerItem,
                             onClear: { vm.lastFrameImage = nil; lastPickerItem = nil }
@@ -491,6 +494,19 @@ struct CreateTabView: View {
                         .background(Color(UIColor.tertiarySystemFill))
                         .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                         .font(.subheadline)
+                }
+
+                if vm.activeModelSpec.modality == .image {
+                    Toggle(L("使用 MiniMax-H3-Image-PE 增强提示词", "Expand prompt with MiniMax-H3-Image-PE"), isOn: $vm.enhanceImagePrompt)
+                        .font(.subheadline)
+                    if vm.enhanceImagePrompt {
+                        Text(L(
+                            "在 Colab 运行 PE 时，首次下载约 17 GB 的权重，首次修图另需约 931 MB。每批生成时自动加载 PE，扩写后释放显存。配置远程 PE 后，由远程服务加载权重。",
+                            "When PE runs on Colab, it downloads about 17 GB on first use and another 931 MB for the first edit. It loads PE for each batch and frees its GPU memory after expansion. If you use a remote PE service, that service loads the weights."
+                        ))
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    }
                 }
 
                 // Stereo Audio Prompts for MiniMax-H3
@@ -1069,6 +1085,70 @@ struct CreateTabView: View {
                 .padding(14)
                 .background(Color(UIColor.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+        }
+    }
+
+    private var editReferencePicker: some View {
+        let limit = vm.editReferenceLimit
+        let remaining = max(0, limit - vm.editReferences.count)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(L("参考图", "References") + " (\(vm.editReferences.count)/\(limit))")
+                    .foregroundColor(vm.editReferences.count > limit ? .red : .secondary)
+                Spacer()
+                PhotosPicker(selection: $editPickerItems, maxSelectionCount: max(1, remaining),
+                             selectionBehavior: .ordered, matching: .images) {
+                    Label(L("添加图片", "Add photos"), systemImage: "photo.badge.plus")
+                }
+                .disabled(remaining == 0 || vm.loadingEditReferences)
+            }
+            if vm.loadingEditReferences { ProgressView() }
+            ScrollView(.horizontal) {
+                HStack {
+                    ForEach(Array(vm.editReferences.enumerated()), id: \.element.id) { index, photo in
+                        VStack {
+                            Image(uiImage: photo.preview).resizable().scaledToFit().frame(width: 76, height: 66)
+                            HStack {
+                                Text("<Picture \(index + 1)>")
+                                Button(role: .destructive) { vm.editReferences.removeAll { $0.id == photo.id } } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                }
+                                .accessibilityLabel(L("移除图 \(index + 1)", "Remove picture \(index + 1)"))
+                            }
+                        }
+                    }
+                }
+            }
+            if vm.enhanceImagePrompt {
+                Text(L("PE 会按此顺序读取参考图并增强编辑指令。", "PE reads the references in this order to expand your edit instruction."))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .font(.caption)
+        .onChange(of: editPickerItems) { items in
+            guard !items.isEmpty else { return }
+            vm.loadingEditReferences = true
+            Task {
+                defer {
+                    editPickerItems = []
+                    vm.loadingEditReferences = false
+                }
+                var added: [EditReferencePhoto] = []
+                for item in items {
+                    guard let data = try? await item.loadTransferable(type: Data.self),
+                          let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.9),
+                          let preview = image.preparingThumbnail(of: CGSize(width: 160, height: 160)) else {
+                        vm.showToast(L("未能读取所选参考图，请重新选择。", "Could not read the selected references. Please select them again."))
+                        return
+                    }
+                    added.append(EditReferencePhoto(jpeg: jpeg, preview: preview))
+                }
+                guard vm.editReferences.count + added.count <= vm.editReferenceLimit else {
+                    vm.showToast(L("最多可选 \(vm.editReferenceLimit) 张参考图。", "Choose up to \(vm.editReferenceLimit) reference photos."))
+                    return
+                }
+                vm.editReferences.append(contentsOf: added)
             }
         }
     }

@@ -318,7 +318,7 @@ val OPEN_MODEL_CATALOG: List<OpenModelSpec> = listOf(
         defaultSteps = 40f,
         modes = listOf(
             TaskModeItem("t2i", "高清文生图", "HD Text-to-Image", "复杂构图、精准中英文文字排版与高质感插画摄影", "Complex layouts, accurate bilingual text & high-detail art"),
-            TaskModeItem("i2i_edit", "多图指令修图", "Instruction Photo Edit", "从相册选 1~2 张照片，用自然语言改局部、换背景或融合主体", "Pick 1–2 photos to edit regions, swap backgrounds, or fuse subjects")
+            TaskModeItem("i2i_edit", "多图指令修图", "Instruction Photo Edit", "从相册选取多张照片，用自然语言改局部、换背景或融合主体", "Pick reference photos to edit regions, swap backgrounds, or fuse subjects")
         ),
         defaultFiles = (1..2).map { ModelFileItem(String.format(Locale.US, "transformer/diffusion_pytorch_model-%05d-of-00002.safetensors", it), "DiT $it/2") } +
             (1..4).map { ModelFileItem(String.format(Locale.US, "text_encoder/model-%05d-of-00004.safetensors", it), "编码器 $it/4") } +

@@ -56,6 +56,8 @@ enum class AppTab(val index: Int) {
     SETTINGS(3)
 }
 
+data class EditReferencePhoto(val jpegBase64: String, val preview: Bitmap)
+
 class StudioViewModel(application: Application) : AndroidViewModel(application) {
 
     internal val appContext: Context = application.applicationContext
@@ -85,6 +87,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         private set
 
     fun updateColabServerURL(url: String) {
+        if (colabServerURL != url) reportedReferenceLimit = null
         colabServerURL = url
         prefs.edit().putString("colabServerURL", url).apply()
     }
@@ -235,11 +238,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     // Generation Parameters
     var taskModeId by mutableStateOf("t2va")
     var visualPrompt by mutableStateOf(PRESET_TEMPLATES[0].visual)
+    var enhanceImagePrompt by mutableStateOf(false)
     var negativePrompt by mutableStateOf("")
     var soundscapePrompt by mutableStateOf(PRESET_TEMPLATES[0].soundscape)
     var musicPrompt by mutableStateOf(PRESET_TEMPLATES[0].music)
     var firstFrameBitmap by mutableStateOf<Bitmap?>(null)
     var lastFrameBitmap by mutableStateOf<Bitmap?>(null)
+    val editReferences = mutableStateListOf<EditReferencePhoto>()
+    var loadingEditReferences by mutableStateOf(false)
+        private set
+    private var reportedReferenceLimit by mutableStateOf<Int?>(null)
+    val editReferenceLimit: Int get() = reportedReferenceLimit ?: if (selectedModelId == "z_image_turbo") 1 else 2
     var selectedVideoResolution by mutableStateOf(VIDEO_RESOLUTIONS[0])
     var selectedImageResolution by mutableStateOf(IMAGE_RESOLUTIONS[0])
     var numFrames by mutableFloatStateOf(124f)
@@ -555,6 +564,38 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun addEditReferences(context: Context, uris: List<Uri>) {
+        if (uris.isEmpty() || loadingEditReferences) return
+        if (editReferences.size + uris.size > editReferenceLimit) {
+            showToast(L("最多可选 ${editReferenceLimit} 张参考图。", "Choose up to ${editReferenceLimit} reference photos."))
+            return
+        }
+        loadingEditReferences = true
+        viewModelScope.launch {
+            try {
+                val added = withContext(Dispatchers.IO) {
+                    uris.map { uri ->
+                        val bmp = decodeSampledBitmap(context, uri, maxEdge = 1920)
+                            ?: throw java.io.IOException("Could not decode reference photo")
+                        val scale = minOf(1f, 160f / maxOf(bmp.width, bmp.height))
+                        val preview = Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt().coerceAtLeast(1),
+                            (bmp.height * scale).toInt().coerceAtLeast(1), true)
+                        EditReferencePhoto(bitmapToBase64Jpeg(bmp), preview)
+                    }
+                }
+                if (editReferences.size + added.size <= editReferenceLimit) {
+                    editReferences.addAll(added)
+                } else {
+                    showToast(L("最多可选 ${editReferenceLimit} 张参考图。", "Choose up to ${editReferenceLimit} reference photos."))
+                }
+            } catch (e: java.io.IOException) {
+                showToast(L("未能读取所选参考图，请重新选择。", "Could not read the selected references. Please select them again."))
+            } finally {
+                loadingEditReferences = false
+            }
+        }
+    }
+
     internal fun decodeSampledBitmap(context: Context, uri: Uri, maxEdge: Int): Bitmap? {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -574,8 +615,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 }
             } else {
+                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+                options.inJustDecodeBounds = false
+                options.inSampleSize = 1
+                while (maxOf(options.outWidth, options.outHeight) / options.inSampleSize > maxEdge) {
+                    options.inSampleSize *= 2
+                }
                 context.contentResolver.openInputStream(uri)?.use { stream ->
-                    BitmapFactory.decodeStream(stream)
+                    BitmapFactory.decodeStream(stream, null, options)
                 }
             }
         } catch (_: Exception) {
@@ -902,6 +950,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
     fun switchSelectedModel(spec: OpenModelSpec) {
         if (selectedModelId == spec.id) return
         selectedModelId = spec.id
+        reportedReferenceLimit = null
         taskModeId = spec.modes[0].id
         inferenceSteps = spec.defaultSteps
         modelFiles = spec.defaultFiles
@@ -943,9 +992,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         val base = normalizedBaseURL.takeIf { it.isNotEmpty() } ?: return
         try {
             val json = postJsonForStatus("$base/minimax_api/select_model", JSONObject().put("model_id", modelId))
-            if (json != null) applyStatusJson(json)
+            if (json != null && base == normalizedBaseURL && modelId == selectedModelId) {
+                updateEditReferenceLimit(json)
+                applyStatusJson(json)
+            }
         } catch (_: Exception) {
         }
+    }
+
+    private fun updateEditReferenceLimit(json: JSONObject) {
+        reportedReferenceLimit = json.optInt("edit_reference_limit", 0)
+            .takeIf { it > 0 && json.optString("selected_model_id") == selectedModelId }
     }
 
     internal fun applyStatusJson(json: JSONObject) {
@@ -1110,15 +1167,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             statusMessage = L("正在连接并同步云端 GPU 状态...", "Connecting & syncing cloud GPU status...")
         }
         try {
+            val modelId = selectedModelId
             val (code, bodyStr) = withContext(Dispatchers.IO) {
                 val req = Request.Builder()
-                    .url("$base/minimax_api/status?model_id=$selectedModelId")
+                    .url("$base/minimax_api/status?model_id=$modelId")
                     .get()
                     .build()
                 apiClient.newCall(req).execute().use { resp ->
                     resp.code to resp.body?.string().orEmpty()
                 }
             }
+            if (base != normalizedBaseURL || modelId != selectedModelId) return
             if (code != 200) {
                 consecutiveStatusFailures += 1
                 if (!silent || consecutiveStatusFailures >= 6) {
@@ -1128,6 +1187,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             }
             consecutiveStatusFailures = 0
             val json = JSONObject(bodyStr)
+            updateEditReferenceLimit(json)
             applyStatusJson(json)
             if (!silent) {
                 showToast(L("已连接 $gpuName", "Connected to $gpuName"))
@@ -1392,7 +1452,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
     internal fun bitmapToBase64Jpeg(bmp: Bitmap): String {
         val baos = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 90, baos)
+        if (!bmp.compress(Bitmap.CompressFormat.JPEG, 90, baos)) throw java.io.IOException("Could not encode photo")
         return Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
     }
 
@@ -1402,13 +1462,17 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             statusMessage = L("请先输入提示词或对话内容！", "Please enter a prompt first!")
             return
         }
-        if ((taskModeId == "fl2va" || taskModeId == "i2i_edit") && firstFrameBitmap == null && lastFrameBitmap == null) {
+        if (taskModeId == "fl2va" && firstFrameBitmap == null && lastFrameBitmap == null) {
             statusMessage = L("请先从手机相册选择至少 1 张参考图片。", "Please select at least 1 reference photo first.")
             return
         }
 
+        val requestedModel = selectedModelId
+        val requestedMode = taskModeId
+        val base = normalizedBaseURL
         viewModelScope.launch {
             checkColabStatus(silent = true)
+            if (requestedModel != selectedModelId || requestedMode != taskModeId || base != normalizedBaseURL) return@launch
             if (!isConnected) {
                 statusMessage = L("尚未连接云端 Colab，请先前往「云算力」页唤醒或连接。", "Not connected to Colab. Wake or connect in Cloud tab first.")
                 return@launch
@@ -1422,7 +1486,15 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 return@launch
             }
 
-            val base = normalizedBaseURL
+            val editing = requestedMode == "i2i_edit"
+            if (editing && (loadingEditReferences || editReferences.size !in 1..editReferenceLimit)) {
+                statusMessage = if (loadingEditReferences) L("正在读取参考图，请稍候。", "Wait for the selected references to finish loading.")
+                    else L("当前修图模式支持 1 至 ${editReferenceLimit} 张参考图，已选 ${editReferences.size} 张。",
+                           "Select 1–${editReferenceLimit} reference photos for this model (${editReferences.size} selected).")
+                return@launch
+            }
+            val references = if (editing) editReferences.map { it.jpegBase64 } else emptyList()
+            val useReferenceArray = reportedReferenceLimit != null
             val myToken = UUID.randomUUID().toString()
             activeGenerationToken = myToken
             isGenerating = true
@@ -1451,8 +1523,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             try {
                 val payload = withContext(Dispatchers.Default) {
                     val obj = JSONObject()
-                        .put("model_id", selectedModelId)
-                        .put("task_mode", taskModeId)
+                        .put("model_id", requestedModel)
+                        .put("task_mode", requestedMode)
                         .put("visual_prompt", promptTrimmed)
                         .put("negative_prompt", negativePrompt)
                         .put("soundscape_prompt", soundscapePrompt)
@@ -1477,8 +1549,18 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                         .put("repeat_penalty", 1.0)
                         .put("reasoning_effort", reasoningEffort)
 
+                    if (activeModelSpec.modality == ModelModality.IMAGE && enhanceImagePrompt) {
+                        obj.put("enhance_prompt", true)
+                    }
                     if (chatPayload.length() > 0) obj.put("chat_messages", chatPayload)
-                    if (taskModeId in listOf("fl2va", "i2v", "i2i_edit", "vlm")) {
+                    if (editing) {
+                        if (useReferenceArray) {
+                            obj.put("reference_images_base64", JSONArray(references))
+                        } else {
+                            obj.put("first_frame_base64", references.first())
+                            if (references.size == 2) obj.put("last_frame_base64", references[1])
+                        }
+                    } else if (requestedMode in listOf("fl2va", "i2v", "vlm")) {
                         firstFrameBitmap?.let { obj.put("first_frame_base64", bitmapToBase64Jpeg(it)) }
                         lastFrameBitmap?.let { obj.put("last_frame_base64", bitmapToBase64Jpeg(it)) }
                     }

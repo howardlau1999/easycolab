@@ -420,8 +420,8 @@ class ColabGuideDialog(QDialog):
                     "Qwen-Image-2.1 / Z-Image-Turbo · 2K Posters & Instruction Editing",
                 ),
                 tr(
-                    "支持精准中英文海报排版直出、双图自然语言融合修图与 8 步极速写实摄影生成。",
-                    "Accurate bilingual poster typography, dual-image natural language fusion editing, and 8-step turbo photorealistic generation.",
+                    "支持精准中英文海报排版直出、多图自然语言融合修图与 8 步极速写实摄影生成。",
+                    "Accurate bilingual poster typography, multi-image natural language editing, and 8-step turbo photorealistic generation.",
                 ),
                 tr("切换至 Qwen-Image-2.1 图像工作台", "Switch to Qwen-Image-2.1 Image Studio"),
                 "qwen_image_21",

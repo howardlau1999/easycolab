@@ -228,8 +228,8 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
                 id: "i2i_edit",
                 titleZh: "多参考图指令修图",
                 titleEn: "Multi-Image Instruction Edit",
-                subtitleZh: "上传 1~2 张参考图（可用 <Picture 1> / <Picture 2> 指代）进行精准修图与主体融合",
-                subtitleEn: "Upload 1–2 reference images (refer via <Picture 1> / <Picture 2>) for precise editing & subject fusion",
+                subtitleZh: "使用最多 16 张参考图，按 <Picture 1>、<Picture 2> 等编号指定编辑对象",
+                subtitleEn: "Edit with up to 16 reference images, identified by <Picture 1>, <Picture 2>, and so on",
                 icon: "wand.and.stars"
             )
         ],
@@ -403,8 +403,8 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
                 id: "i2i_edit",
                 titleZh: "多图指令修图",
                 titleEn: "Multi-Image Instruction Edit",
-                subtitleZh: "上传 1~2 张原图，用自然语言指令改局部、换背景或融合主体",
-                subtitleEn: "Upload 1–2 source images to edit regions, swap backgrounds, or fuse subjects via natural language",
+                subtitleZh: "使用最多 10 张参考图，用自然语言指令改局部、换背景或融合主体",
+                subtitleEn: "Use up to 10 references to edit regions, swap backgrounds, or combine subjects",
                 icon: "wand.and.rays"
             )
         ],
@@ -609,6 +609,14 @@ struct LoadedModelSummary: Codable, Identifiable, Hashable {
     }
 }
 
+struct ImagePEStatus: Codable {
+    let mode: String
+    let weights_cached: Bool
+    let projector_cached: Bool
+    let downloading: Bool
+    let error: String?
+}
+
 struct ColabStatusResponse: Codable {
     var ok: Bool?
     var cuda_available: Bool?
@@ -619,6 +627,7 @@ struct ColabStatusResponse: Codable {
     var model_loaded: Bool?
     var any_model_loaded: Bool?
     var selected_model_id: String?
+    var edit_reference_limit: Int?
     var loaded_model_id: String?
     var loaded_model_ids: [String]?
     var loaded_models_detail: [LoadedModelSummary]?
@@ -662,6 +671,7 @@ struct ColabStatusResponse: Codable {
     var drive_used_gb: Double?
     var drive_free_gb: Double?
     var comfyui: ComfyRemoteStatus?
+    var image_pe: ImagePEStatus?
     var custom_models: [CustomHFModelDTO]?
     var registered_model: CustomHFModelDTO?
     var action_ok: Bool?

@@ -13,6 +13,12 @@ enum AppTab: Int, Hashable {
     case settings = 3
 }
 
+struct EditReferencePhoto: Identifiable {
+    let id = UUID()
+    let jpeg: Data
+    let preview: UIImage
+}
+
 @MainActor
 final class IOSStudioViewModel: ObservableObject {
     @Published var selectedTab: AppTab = .create
@@ -22,7 +28,10 @@ final class IOSStudioViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(maskServerURL, forKey: "maskServerURL") }
     }
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
-        didSet { UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL") }
+        didSet {
+            if colabServerURL != oldValue { reportedReferenceLimit = nil }
+            UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL")
+        }
     }
     @Published var hfToken: String = UserDefaults.standard.string(forKey: "hfToken") ?? "" {
         didSet { UserDefaults.standard.set(hfToken, forKey: "hfToken") }
@@ -89,7 +98,9 @@ final class IOSStudioViewModel: ObservableObject {
     @Published var combinedTelemetryChartMode: Bool = true
 
     // Active Model & VRAM Residency
-    @Published var selectedModelId: String = "minimax_h3"
+    @Published var selectedModelId: String = "minimax_h3" {
+        didSet { if selectedModelId != oldValue { reportedReferenceLimit = nil } }
+    }
     @Published var customModels: [OpenModelSpec] = []
     @Published var showAddCustomModelSheet: Bool = false
     @Published var customRepoIdInput: String = ""
@@ -167,11 +178,16 @@ final class IOSStudioViewModel: ObservableObject {
     // Generation Parameters
     @Published var taskModeId: String = "t2va"
     @Published var visualPrompt: String = PRESET_TEMPLATES[0].visual
+    @Published var enhanceImagePrompt = false
     @Published var negativePrompt: String = ""
     @Published var soundscapePrompt: String = PRESET_TEMPLATES[0].soundscape
     @Published var musicPrompt: String = PRESET_TEMPLATES[0].music
     @Published var firstFrameImage: UIImage? = nil
     @Published var lastFrameImage: UIImage? = nil
+    @Published var editReferences: [EditReferencePhoto] = []
+    @Published var loadingEditReferences = false
+    @Published var reportedReferenceLimit: Int?
+    var editReferenceLimit: Int { reportedReferenceLimit ?? (selectedModelId == "z_image_turbo" ? 1 : 2) }
     @Published var selectedVideoResolution: ResolutionOption = VIDEO_RESOLUTIONS[0]
     @Published var selectedImageResolution: ResolutionOption = IMAGE_RESOLUTIONS[0]
     @Published var numFrames: Double = 124
@@ -807,8 +823,15 @@ final class IOSStudioViewModel: ObservableObject {
             req.httpBody = try JSONSerialization.data(withJSONObject: ["model_id": modelId])
             let (data, _) = try await URLSession.shared.data(for: req)
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            guard base == normalizedBaseURL, selectedModelId == modelId else { return }
+            updateEditReferenceLimit(decoded)
             applyStatusResponse(decoded)
         } catch {}
+    }
+
+    func updateEditReferenceLimit(_ decoded: ColabStatusResponse) {
+        reportedReferenceLimit = decoded.selected_model_id == selectedModelId
+            ? decoded.edit_reference_limit.flatMap { $0 > 0 ? $0 : nil } : nil
     }
 
     func applyStatusResponse(_ decoded: ColabStatusResponse) {
@@ -960,7 +983,7 @@ final class IOSStudioViewModel: ObservableObject {
             statusMessage = L("请先输入提示词或对话内容！", "Please enter a prompt first!")
             return
         }
-        if (taskModeId == "fl2va" || taskModeId == "i2i_edit") && firstFrameImage == nil && lastFrameImage == nil {
+        if taskModeId == "fl2va" && firstFrameImage == nil && lastFrameImage == nil {
             statusMessage = L("请先从手机相册选择至少 1 张参考图片。", "Please select at least 1 reference photo first.")
             return
         }
@@ -972,7 +995,11 @@ final class IOSStudioViewModel: ObservableObject {
             return
         }
 
+        let requestedModel = selectedModelId
+        let requestedMode = taskModeId
+        let base = normalizedBaseURL
         await checkColabStatus(silent: true)
+        guard selectedModelId == requestedModel, taskModeId == requestedMode, normalizedBaseURL == base else { return }
         guard isConnected else {
             statusMessage = L("尚未连接云端 Colab，请先前往「云算力」页唤醒或连接。", "Not connected to Colab. Wake or connect in Cloud tab first.")
             return
@@ -984,7 +1011,16 @@ final class IOSStudioViewModel: ObservableObject {
             return
         }
 
-        let base = normalizedBaseURL
+        if taskModeId == "i2i_edit" {
+            guard !loadingEditReferences else {
+                statusMessage = L("正在读取参考图，请稍候。", "Wait for reference photos to finish loading.")
+                return
+            }
+            guard (1...editReferenceLimit).contains(editReferences.count) else {
+                statusMessage = L("当前修图模式支持 1 至 \(editReferenceLimit) 张参考图，已选 \(editReferences.count) 张。", "Select 1–\(editReferenceLimit) reference photos for this model (\(editReferences.count) selected).")
+                return
+            }
+        }
         guard let submitURL = URL(string: "\(base)/minimax_api/generate") else { return }
 
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -1045,8 +1081,19 @@ final class IOSStudioViewModel: ObservableObject {
                 "repeat_penalty": 1.0,
                 "reasoning_effort": reasoningEffort
             ]
+            if activeModelSpec.modality == .image && enhanceImagePrompt {
+                payload["enhance_prompt"] = true
+            }
             if !chatPayload.isEmpty { payload["chat_messages"] = chatPayload }
-            if ["fl2va", "i2v", "i2i_edit", "vlm"].contains(taskModeId) {
+            if taskModeId == "i2i_edit" {
+                let refs = editReferences.map { $0.jpeg.base64EncodedString() }
+                if reportedReferenceLimit != nil {
+                    payload["reference_images_base64"] = refs
+                } else {
+                    payload["first_frame_base64"] = refs[0]
+                    if refs.count == 2 { payload["last_frame_base64"] = refs[1] }
+                }
+            } else if ["fl2va", "i2v", "vlm"].contains(taskModeId) {
                 if let img1 = firstFrameImage, let jpg = img1.jpegData(compressionQuality: 0.90) {
                     payload["first_frame_base64"] = jpg.base64EncodedString()
                 }

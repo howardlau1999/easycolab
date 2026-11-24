@@ -24,10 +24,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.HelpOutline
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AddPhotoAlternate
@@ -90,6 +92,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -1100,11 +1103,75 @@ private fun ModelVramReadinessCard(vm: StudioViewModel) {
 }
 
 @Composable
+private fun EditReferencePicker(vm: StudioViewModel) {
+    val context = LocalContext.current
+    val count = vm.editReferences.size
+    val limit = vm.editReferenceLimit
+    val multiple = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia((limit - count).coerceAtLeast(2))
+    ) { uris ->
+        vm.addEditReferences(context, uris)
+    }
+    val single = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.addEditReferences(context, listOf(uri))
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = L("参考图", "References") + " ($count/$limit)",
+                color = if (count > limit) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+            )
+            TextButton(
+                onClick = {
+                    val request = PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    if (limit - count == 1) single.launch(request) else multiple.launch(request)
+                },
+                enabled = count < limit && !vm.loadingEditReferences
+            ) {
+                Text(L("添加图片", "Add photos"))
+            }
+        }
+        if (vm.loadingEditReferences) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            vm.editReferences.forEachIndexed { index, photo ->
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Image(photo.preview.asImageBitmap(), contentDescription = null,
+                        modifier = Modifier.size(76.dp), contentScale = ContentScale.Fit)
+                    Text("<Picture ${index + 1}>", style = MaterialTheme.typography.labelSmall)
+                    Row {
+                        IconButton(enabled = index > 0, onClick = {
+                            vm.editReferences.add(index - 1, vm.editReferences.removeAt(index))
+                        }) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = L("前移图 ${index + 1}", "Move picture ${index + 1} earlier"))
+                        }
+                        IconButton(onClick = { vm.editReferences.removeAt(index) }) {
+                            Icon(Icons.Default.Close,
+                                contentDescription = L("移除图 ${index + 1}", "Remove picture ${index + 1}"))
+                        }
+                    }
+                }
+            }
+        }
+        if (vm.enhanceImagePrompt) {
+            Text(L("PE 会按此顺序读取参考图并增强编辑指令。", "PE reads the references in this order to expand your edit instruction."),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
 private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
     val context = LocalContext.current
     val spec = vm.activeModelSpec
     val isVideo = spec.modality == ModelModality.VIDEO_AUDIO
-    val needsPhotos = vm.taskModeId in listOf("fl2va", "i2i_edit")
     var showAdvancedParams by remember { mutableStateOf(false) }
 
     val pickFirstLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
@@ -1169,14 +1236,15 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
                 }
             }
 
-            // Photo Reference Slots (when Keyframes or Image Edit selected)
-            if (needsPhotos) {
+            if (vm.taskModeId == "i2i_edit") {
+                EditReferencePicker(vm)
+            } else if (vm.taskModeId == "fl2va") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     KeyframeSlotBox(
-                        title = if (isVideo) L("首帧参考图", "Start Frame") else L("主参考图", "Reference 1"),
+                        title = L("首帧参考图", "Start Frame"),
                         bitmap = vm.firstFrameBitmap,
                         onPick = {
                             pickFirstLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
@@ -1185,7 +1253,7 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
                         modifier = Modifier.weight(1f)
                     )
                     KeyframeSlotBox(
-                        title = if (isVideo) L("尾帧参考图 (可选)", "End Frame (Opt)") else L("融合图 2 (可选)", "Reference 2 (Opt)"),
+                        title = L("尾帧参考图 (可选)", "End Frame (Opt)"),
                         bitmap = vm.lastFrameBitmap,
                         onPick = {
                             pickLastLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
@@ -1212,6 +1280,34 @@ private fun VideoAndImageWorkspaceSection(vm: StudioViewModel) {
                 maxLines = 6,
                 modifier = Modifier.fillMaxWidth()
             )
+
+            if (spec.modality == ModelModality.IMAGE) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().toggleable(
+                        value = vm.enhanceImagePrompt,
+                        role = Role.Switch,
+                        onValueChange = { vm.enhanceImagePrompt = it }
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = L("使用 MiniMax-H3-Image-PE 增强提示词", "Enhance prompt with MiniMax-H3-Image-PE"),
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(checked = vm.enhanceImagePrompt, onCheckedChange = null)
+                }
+                if (vm.enhanceImagePrompt) {
+                    Text(
+                        text = L(
+                            "在 Colab 运行 PE 时，首次下载约 17 GB 的权重，首次修图另需约 931 MB。每批生成时自动加载 PE，扩写后释放显存。配置远程 PE 后，由远程服务加载权重。",
+                            "When PE runs on Colab, it downloads about 17 GB on first use and another 931 MB for the first edit. It loads PE for each batch and frees its GPU memory after expansion. If you use a remote PE service, that service loads the weights."
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
 
             // Audio Prompts for MiniMax-H3
             if (isVideo) {

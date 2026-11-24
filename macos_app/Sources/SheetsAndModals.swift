@@ -537,8 +537,8 @@ struct ColabGuideSheet: View {
             number: "D",
             title: L("Qwen-Image-2.1 / Z-Image-Turbo · 2K 海报生图与自然语言修图", "Qwen-Image-2.1 / Z-Image-Turbo · 2K Poster Generation & Image Editing"),
             detail: L(
-                "支持精准中英文海报排版直出，以及上传 1～2 张参考图用一句话指令改服装、换背景或融合多图主体；Z-Image-Turbo 更支持 8 步秒级出图。",
-                "Render crisp bilingual typography posters, or upload 1–2 reference images for natural-language outfit swaps, background replacement, and multi-subject fusion; Z-Image-Turbo delivers sub-second 8-step generation."
+                "Qwen-Image-2.1 支持中英文海报排版和最多 10 张参考图，可按指令换装、换背景或融合主体。Z-Image-Turbo 支持单图重绘与 8 步生成。",
+                "Qwen-Image-2.1 supports bilingual typography and up to 10 references for outfit swaps, background edits, and combining subjects. Z-Image-Turbo supports single-image restyling and 8-step generation."
             ),
             palette: palette
         ) {

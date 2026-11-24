@@ -207,6 +207,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
         # ── Generation & Sampling State ──
         self.visual_prompt: str = PRESET_TEMPLATES[0].visual
+        self.enhance_image_prompt: bool = False
+        self.edit_reference_limit: Optional[int] = None
         self.soundscape_prompt: str = PRESET_TEMPLATES[0].soundscape
         self.music_prompt: str = PRESET_TEMPLATES[0].music
         self.negative_prompt: str = ""
@@ -424,6 +426,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         cleaned = (url or "").strip()
         if cleaned != self.colab_server_url:
             self._remote_api_key_synced = False
+            self.edit_reference_limit = None
             self.colab_server_url = cleaned
             self._save_setting("colabServerURL", cleaned)
             self.state_changed.emit()
@@ -509,6 +512,12 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
     @property
     def active_model_spec(self) -> OpenModelSpec:
         return MODEL_SPEC_MAP.get(self.selected_model_id, OPEN_MODEL_CATALOG[0])
+
+    @property
+    def max_edit_references(self) -> int:
+        if self.edit_reference_limit is not None:
+            return self.edit_reference_limit
+        return 2 if self.selected_model_id in {"qwen_image_21", "minimax_h3_image"} else 1
 
     @property
     def context_length_tokens(self) -> int:
@@ -677,6 +686,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
 
     def reset_stale_remote_runtime_state(self, message: str = "") -> None:
         self.is_connected = False
+        self.edit_reference_limit = None
         self.gpu_name = tr("尚未连接云端 GPU", "Cloud GPU Not Connected")
         self.vram_used_gb = 0.0
         self.vram_total_gb = 0.0
@@ -898,6 +908,14 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self.state_changed.emit()
         self.telemetry_changed.emit()
 
+    def _apply_model_status(self, base: str, model_id: str, data: dict, update_status_msg: bool) -> None:
+        if base != self.normalized_base_url or model_id != self.selected_model_id:
+            return
+        if data.get("selected_model_id") == model_id:
+            limit = data.get("edit_reference_limit")
+            self.edit_reference_limit = limit if type(limit) is int and limit > 0 else None
+        self._apply_status_response(data, update_status_msg=update_status_msg)
+
     def check_colab_status(self, silent: bool = False) -> None:
         base = self.normalized_base_url
         if not base:
@@ -924,7 +942,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                 )
                 if r.status_code == 200:
                     payload = r.json()
-                    self._dispatch_ui(lambda: self._apply_status_response(payload, update_status_msg=not silent))
+
+                    self._dispatch_ui(lambda: self._apply_model_status(base, target_model, payload, not silent))
                 elif r.status_code == 404:
 
                     def on_404() -> None:
@@ -974,6 +993,8 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         if model_id not in MODEL_SPEC_MAP:
             return
         spec = MODEL_SPEC_MAP[model_id]
+        if model_id != self.selected_model_id:
+            self.edit_reference_limit = None
         self.selected_model_id = model_id
         if spec.modes:
             self.task_mode_id = spec.modes[0].id
@@ -996,7 +1017,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
                     )
                     if r.status_code == 200:
                         data = r.json()
-                        self._dispatch_ui(lambda: self._apply_status_response(data, update_status_msg=True))
+                        self._dispatch_ui(lambda: self._apply_model_status(base, model_id, data, True))
                 except Exception:
                     pass
 
@@ -1172,6 +1193,7 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
         self,
         first_frame_b64: Optional[str] = None,
         last_frame_b64: Optional[str] = None,
+        reference_images_b64: Optional[List[str]] = None,
     ) -> None:
         if self.is_generating:
             return
@@ -1191,13 +1213,20 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             )
             self.state_changed.emit()
             return
-        if self.task_mode_id == "i2i_edit" and not first_frame_b64 and not last_frame_b64:
-            self.status_message = tr(
-                "指令修图/重绘模式请至少上传一张参考原图。",
-                "Instruction Edit / Img2Img mode requires at least one reference image.",
-            )
-            self.state_changed.emit()
-            return
+        if self.task_mode_id == "i2i_edit":
+            if reference_images_b64 is None:
+                reference_images_b64 = [ref for ref in (first_frame_b64, last_frame_b64) if ref]
+            if not reference_images_b64 or not all(reference_images_b64):
+                self.status_message = tr("请添加有效的修图参考图。", "Add a valid reference image to edit.")
+                self.state_changed.emit()
+                return
+            if len(reference_images_b64) > self.max_edit_references:
+                self.status_message = tr(
+                    f"当前模型和服务端最多可用 {self.max_edit_references} 张参考图。请移除多余的图片。",
+                    f"The current model and server accept up to {self.max_edit_references} references. Remove the extra images.",
+                )
+                self.state_changed.emit()
+                return
 
         base = self.normalized_base_url
         if not self.is_connected or not base:
@@ -1267,9 +1296,17 @@ class EasyColabViewModel(ViewModelServicesMixin, QObject):
             "repeat_penalty": 1.0,
             "reasoning_effort": self.reasoning_effort,
         }
+        if modality == ModelModality.IMAGE and self.enhance_image_prompt:
+            payload["enhance_prompt"] = True
         if chat_messages_payload is not None:
             payload["chat_messages"] = chat_messages_payload
-        if self.task_mode_id in {"fl2va", "i2v", "i2i_edit", "vlm"}:
+        if self.task_mode_id == "i2i_edit":
+            if self.edit_reference_limit is not None:
+                payload["reference_images_base64"] = reference_images_b64
+            else:
+                for field, ref in zip(("first_frame_base64", "last_frame_base64"), reference_images_b64):
+                    payload[field] = ref
+        elif self.task_mode_id in {"fl2va", "i2v", "vlm"}:
             if first_frame_b64:
                 payload["first_frame_base64"] = first_frame_b64
             if last_frame_b64:

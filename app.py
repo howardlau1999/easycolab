@@ -31,7 +31,7 @@ import subprocess
 import threading
 from collections import deque
 from datetime import datetime
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Callable
 
 # ==============================================================================
 # 实时终端进度与 tqdm 捕获器 (将 Colab 网页端的实时下载进度同步给 macOS App)
@@ -146,7 +146,7 @@ import json
 import shutil
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 import torch
 import gradio as gr
 from PIL import Image
@@ -1474,6 +1474,16 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
 }
 
 MINIMAX_H3_IMAGE_FILES = list(MODEL_CATALOG["minimax_h3_image"]["files"])
+EDIT_REFERENCE_LIMITS = {"minimax_h3_image": 16, "qwen_image_21": 10, "z_image_turbo": 1}
+MINIMAX_IMAGE_PE_REPO = "MiniMaxAI/MiniMax-H3-Image-PE"
+IMAGE_PE_GGUF_REPO = "prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF"
+IMAGE_PE_GGUF_REVISION = "fce97403ab2a34b62317bd7b37f380fecaef2565"
+IMAGE_PE_WEIGHT = "MiniMax-H3-Image-PE-NVFP4.gguf"
+IMAGE_PE_PROJECTOR = "MiniMax-H3-Image-PE.mmproj.gguf"
+IMAGE_PE_FILE_SIZES = {IMAGE_PE_WEIGHT: 17_010_708_032, IMAGE_PE_PROJECTOR: 931_146_464}
+_IMAGE_PE_DOWNLOAD_LOCK = threading.Lock()
+_IMAGE_PE_DOWNLOADS: Dict[str, Future] = {}
+_IMAGE_PE_ERRORS: Dict[str, str] = {}
 BUILTIN_MODEL_IDS = set(MODEL_CATALOG.keys())
 CUSTOM_MODELS_LOCK = threading.Lock()
 
@@ -1542,7 +1552,7 @@ def _load_persisted_custom_models():
                     continue
                 mid = str(item["id"])
                 item_repo_low = str(item.get("repo_id") or "").strip().lower()
-                if mid in BUILTIN_MODEL_IDS or item_repo_low == "minimaxai/minimax-h3-image":
+                if mid in BUILTIN_MODEL_IDS or item_repo_low in ("minimaxai/minimax-h3-image", MINIMAX_IMAGE_PE_REPO.lower()):
                     continue
                 raw_files = item.get("files") or []
                 norm_files: List[Tuple[str, str]] = []
@@ -2103,6 +2113,8 @@ def inspect_and_resolve_hf_repo(
         raise ValueError(f"无效的 HuggingFace 仓库地址: '{repo_id}'（格式应为 Owner/Repo）")
 
     repo_low = repo_clean.lower()
+    if repo_low == MINIMAX_IMAGE_PE_REPO.lower():
+        raise ValueError("请在生图工作区开启 MiniMax-H3-Image-PE 指令增强。")
     # 兼容已知特定多模态/图像生成仓库结构（如用户在客户端手动导入）
     if not pat_clean:
         if repo_low == "minimaxai/minimax-h3-image" or ("minimax-h3-image" in repo_low and "gguf" not in repo_low):
@@ -3071,6 +3083,7 @@ def _idle_watchdog_loop():
         if (
             MODEL_DOWNLOAD_STATE["is_downloading"]
             or MODEL_DOWNLOAD_STATE["is_loading_vram"]
+            or bool(_IMAGE_PE_DOWNLOADS)
             or GPU_LOCK.locked()
             or _ACTIVE_API_STREAMS > 0
             or COMFYUI_STATE.get("is_running")
@@ -3237,6 +3250,7 @@ def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
         "selected_model_name": spec["name"],
         "selected_model_repo": spec["repo_id"],
         "selected_model_modality": spec["modality"],
+        "edit_reference_limit": EDIT_REFERENCE_LIMITS.get(spec.get("pipeline_arch") or target_id),
         "files": files_info,
         "downloaded_count": downloaded_count,
         "total_count": len(req_files),
@@ -3455,6 +3469,7 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
         "loaded_context_length": loaded_ctx,
         "is_downloading": MODEL_DOWNLOAD_STATE["is_downloading"],
         "is_loading_vram": MODEL_DOWNLOAD_STATE["is_loading_vram"],
+        "image_pe": _get_image_pe_status(),
         "task_progress": MODEL_DOWNLOAD_STATE["progress"],
         "task_message": MODEL_DOWNLOAD_STATE["message"],
         "uptime_seconds": uptime_seconds,
@@ -3989,6 +4004,208 @@ def load_minimax_h3_image_pipeline(
     return pipe, f"{spec['name']} · BF16 · {tag_suffix}"
 
 
+def _image_pe_file_cached(path: str) -> bool:
+    try:
+        return os.path.getsize(path) == IMAGE_PE_FILE_SIZES[os.path.basename(path)]
+    except OSError:
+        return False
+
+
+def _get_image_pe_status() -> Dict[str, Any]:
+    if os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip():
+        return {"mode": "remote", "weights_cached": False, "projector_cached": False, "downloading": False, "error": ""}
+    directory = os.path.join(MODEL_BASE_ROOT, IMAGE_PE_GGUF_REPO)
+    weights = os.path.join(directory, IMAGE_PE_WEIGHT)
+    projector = os.path.join(directory, IMAGE_PE_PROJECTOR)
+    weights_cached = _image_pe_file_cached(weights)
+    projector_cached = _image_pe_file_cached(projector)
+    with _IMAGE_PE_DOWNLOAD_LOCK:
+        return {
+            "mode": "local",
+            "weights_cached": weights_cached,
+            "projector_cached": projector_cached,
+            "downloading": weights in _IMAGE_PE_DOWNLOADS or projector in _IMAGE_PE_DOWNLOADS,
+            "error": (_IMAGE_PE_ERRORS.get(weights) if not weights_cached else "")
+                     or (_IMAGE_PE_ERRORS.get(projector) if not projector_cached else "") or "",
+        }
+
+
+def _download_image_pe_file(path: str, future: Future):
+    name = os.path.basename(path)
+    failure = None
+    try:
+        if not _image_pe_file_cached(path):
+            from huggingface_hub import hf_hub_download
+
+            hf_hub_download(
+                repo_id=IMAGE_PE_GGUF_REPO, revision=IMAGE_PE_GGUF_REVISION, filename=name,
+                local_dir=os.path.dirname(path), force_download=os.path.exists(path),
+            )
+            if not _image_pe_file_cached(path):
+                raise IOError(f"{name} 下载后的文件大小与发布版本不符")
+    except Exception as exc:
+        failure = exc
+    with _IMAGE_PE_DOWNLOAD_LOCK:
+        _IMAGE_PE_DOWNLOADS.pop(path)
+        if failure is None:
+            future.set_result(path)
+        else:
+            _IMAGE_PE_ERRORS[path] = f"{name}: {failure}"
+            future.set_exception(failure)
+
+
+def _queue_image_pe_weights(include_projector: bool) -> Tuple[List[str], List[Future]]:
+    """Prefetch missing GGUF files. Generation can await the same transfers as manual downloads."""
+    _refresh_drive_mount_state()
+    directory = os.path.join(MODEL_BASE_ROOT, IMAGE_PE_GGUF_REPO)
+    names = [IMAGE_PE_WEIGHT, IMAGE_PE_PROJECTOR] if include_projector else [IMAGE_PE_WEIGHT]
+    paths = [os.path.join(directory, name) for name in names]
+    futures = []
+    for path in paths:
+        if _image_pe_file_cached(path):
+            continue
+        with _IMAGE_PE_DOWNLOAD_LOCK:
+            future = _IMAGE_PE_DOWNLOADS.get(path)
+            if future is None:
+                future = Future()
+                _IMAGE_PE_DOWNLOADS[path] = future
+                _IMAGE_PE_ERRORS.pop(path, None)
+                try:
+                    threading.Thread(target=_download_image_pe_file, args=(path, future), daemon=True).start()
+                except RuntimeError as exc:
+                    del _IMAGE_PE_DOWNLOADS[path]
+                    _IMAGE_PE_ERRORS[path] = str(exc)
+                    raise
+            futures.append(future)
+    return paths, futures
+
+
+def _build_image_pe_request(prompt: str, images: List[Any], width: int, height: int, seed: int) -> Dict[str, Any]:
+    from pathlib import Path
+    from math import gcd
+    from huggingface_hub import snapshot_download
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("请先输入要增强的图像指令。")
+    prompt_dir = Path(snapshot_download(
+        repo_id=MINIMAX_IMAGE_PE_REPO,
+        revision="35603d4b63949afa12cb098227fffefedf081afa",
+        allow_patterns=["prompt/t2i/*", "prompt/edit/task_prompt.txt"],
+        local_dir=os.path.join(MODEL_BASE_ROOT, MINIMAX_IMAGE_PE_REPO),
+    )) / "prompt"
+    params = json.loads((prompt_dir / "t2i/request_params.json").read_text(encoding="utf-8"))
+    if images:
+        if width <= 0 or height <= 0:
+            raise ValueError("图像编辑的输出宽高必须为正数。")
+        divisor = gcd(width, height)
+        ratio = f"{width // divisor}:{height // divisor}"
+        count = len(images)
+        content = [
+            {"type": "text", "text": (prompt_dir / "edit/task_prompt.txt").read_text(encoding="utf-8")},
+            {"type": "text", "text": f"Reference Image Count:\n{count} input image(s), labeled <Picture 1> through <Picture {count}>."},
+        ]
+        for index, image in enumerate(images, 1):
+            w, h = image.size
+            divisor = gcd(w, h)
+            content.append({"type": "text", "text": f"Reference Media:\n- <Picture {index}> [aspect_ratio {w // divisor}:{h // divisor}]"})
+            content.append({"type": "image_url", "image_url": {"url": _pil_to_jpeg_data_url(image)}})
+        content.append({"type": "text", "text": (
+            f"\nUser Editing Instruction (JSON string):\n{json.dumps(prompt, ensure_ascii=False)}\n\n"
+            f"User Aspect Ratio Selection:\n{ratio}\n\n"
+            "Apply the instructions above to the supplied inputs and reference images. "
+            "Output only the required two-field JSON object."
+        )})
+        messages = [{"role": "user", "content": content}]
+        params["response_format"]["json_schema"]["schema"] = {
+            "type": "object",
+            "properties": {"expanded_caption": {"type": "string"}, "target_aspect_ratio": {"type": "string", "enum": [ratio]}},
+            "required": ["expanded_caption", "target_aspect_ratio"], "additionalProperties": False,
+        }
+    else:
+        task_prompt = (prompt_dir / "t2i/task_prompt.txt").read_text(encoding="utf-8")
+        system_prompt = (prompt_dir / "t2i/system_prompt.txt").read_text(encoding="utf-8").strip()
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": task_prompt.format(prompt)}]
+    return {**params, "model": "MiniMax-H3-Image-PE", "messages": messages, "seed": seed, "stream": False}
+
+
+def _request_image_pe_caption(
+    base_url: str, payload: Dict[str, Any], cancel_event: Optional[threading.Event] = None,
+) -> str:
+    import asyncio
+    import httpx
+
+    async def post():
+        async with httpx.AsyncClient(timeout=1200, trust_env=False) as client:
+            request = asyncio.create_task(client.post(base_url.rstrip("/") + "/chat/completions", json=payload))
+            try:
+                while cancel_event is not None and not request.done():
+                    if cancel_event.is_set():
+                        raise GenerationAbortedError("已手动停止当前推理任务")
+                    await asyncio.wait([request], timeout=0.25)
+                response = await request
+                response.raise_for_status()
+                return response.json()
+            finally:
+                if not request.done():
+                    request.cancel()
+                    await asyncio.gather(request, return_exceptions=True)
+
+    result = asyncio.run(post())
+    try:
+        choice = result["choices"][0]
+        if choice["finish_reason"] != "stop":
+            raise ValueError(f"指令增强未生成完整结果 ({choice['finish_reason']})")
+        caption = json.loads(choice["message"]["content"])["expanded_caption"]
+        if not isinstance(caption, str) or not caption.strip():
+            raise ValueError("增强结果缺少有效的 expanded_caption。")
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("指令增强服务返回了无效的 JSON 结果。") from exc
+    return caption.strip()
+
+
+def expand_image_prompt(
+    prompt: str, *, images: List[Any], width: int, height: int, seed: int,
+    cancel_event: Optional[threading.Event] = None,
+    on_stage: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Run the PE checkpoint for one batch while the caller holds GPU_LOCK."""
+    payload = _build_image_pe_request(prompt, images, width, height, seed)
+    base_url = os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip()
+    if base_url:
+        # An operator can serve the original MiniMax checkpoint on a separate GPU with SGLang.
+        if on_stage:
+            on_stage("MiniMax-H3-Image-PE 正在增强提示词...")
+        return _request_image_pe_caption(base_url, payload, cancel_event)
+    paths, transfers = _queue_image_pe_weights(bool(images))
+    if transfers and on_stage:
+        on_stage("正在下载 MiniMax-H3-Image-PE 所需权重...")
+    for transfer in transfers:
+        while cancel_event is not None and not transfer.done():
+            if cancel_event.wait(0.25):
+                raise GenerationAbortedError("已手动停止当前推理任务")
+        transfer.result()
+    if cancel_event is not None and cancel_event.is_set():
+        raise GenerationAbortedError("已手动停止当前推理任务")
+    if on_stage:
+        on_stage("正在加载 MiniMax-H3-Image-PE 到显存...")
+    _reclaim_transient_gpu_memory()
+    free_gib = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
+    pe_context = 32768
+    # With many references, reserve half the context for the edit instructions, reasoning and response.
+    image_max_tokens = pe_context // (2 * len(images)) if len(images) > 2 else None
+    bundle = _start_qwen_gguf_server(
+        paths[0], paths[1] if images else None, ctx_len=pe_context, cur_free_gb=free_gib,
+        image_max_tokens=image_max_tokens,
+        model_id="minimax_h3_image_pe", model_name=payload["model"], for_prompt_expansion=True, cancel_event=cancel_event,
+    )
+    try:
+        if on_stage:
+            on_stage("MiniMax-H3-Image-PE 正在增强提示词...")
+        return _request_image_pe_caption(bundle["base_url"] + "/v1", payload, cancel_event)
+    finally:
+        _stop_gguf_server_bundle(bundle)
+
+
 def run_minimax_h3_image_inference(
     active_pipe: Any,
     prompt: str,
@@ -4185,7 +4402,16 @@ def _download_file_to_path(url: str, dst_path: str, desc: str = ""):
                 MODEL_DOWNLOAD_STATE["message"] = f"{desc} ({done/(1024**2):.0f}/{total/(1024**2):.0f} MB · {pct}%)"
 
 
-def _ensure_llama_server_binary() -> Tuple[str, Dict[str, str]]:
+_LLAMA_SERVER_INSTALL_LOCK = threading.Lock()
+
+
+def _ensure_llama_server_binary(report_progress: bool = True) -> Tuple[str, Dict[str, str]]:
+    # A model-center download can run while a generation job prepares its PE server.
+    with _LLAMA_SERVER_INSTALL_LOCK:
+        return _install_or_reuse_llama_server(report_progress)
+
+
+def _install_or_reuse_llama_server(report_progress: bool) -> Tuple[str, Dict[str, str]]:
     """
     自动安装/校验官方 ggml-org/llama.cpp Linux x64 CUDA 12.8 预编译 llama-server + cudart 二进制。
     固定使用 ubuntu-cuda-12.x（NVIDIA 驱动向下兼容 CUDA 12.x/13.0/13.5+ 全系驱动，避免 CUDA 13.5 PTX 在 Colab 13.0 驱动上报 unsupported toolchain）。
@@ -4289,7 +4515,7 @@ def _ensure_llama_server_binary() -> Tuple[str, Dict[str, str]]:
 
     print(f"[GGUF 引擎] 正在下载官方预编译 llama.cpp CUDA 12 推理后端: {os.path.basename(main_url)} ...")
     tar_path = os.path.join(install_dir, "llama_cuda_bin.tar.gz")
-    _download_file_to_path(main_url, tar_path, desc="正在下载 llama.cpp CUDA 引擎")
+    _download_file_to_path(main_url, tar_path, desc="正在下载 llama.cpp CUDA 引擎" if report_progress else "")
     subprocess.check_call(["tar", "-xzf", tar_path, "-C", install_dir])
     try:
         os.remove(tar_path)
@@ -4299,7 +4525,7 @@ def _ensure_llama_server_binary() -> Tuple[str, Dict[str, str]]:
     if cudart_url:
         print(f"[GGUF 引擎] 正在下载配套 CUDA 12 Runtime 动态库 ({os.path.basename(cudart_url)})...")
         rt_tar = os.path.join(install_dir, "cudart_bin.tar.gz")
-        _download_file_to_path(cudart_url, rt_tar, desc="正在下载 CUDA Runtime 动态库")
+        _download_file_to_path(cudart_url, rt_tar, desc="正在下载 CUDA Runtime 动态库" if report_progress else "")
         subprocess.check_call(["tar", "-xzf", rt_tar, "-C", install_dir])
         try:
             os.remove(rt_tar)
@@ -4344,13 +4570,16 @@ def _start_qwen_gguf_server(
     model_id: str = "qwen38_27b_gguf",
     model_name: str = "Qwen3.8-27B",
     total_weights_gb: Optional[float] = None,
+    for_prompt_expansion: bool = False,
+    cancel_event: Optional[threading.Event] = None,
+    image_max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     启动驻留 GPU 的 llama-server 实例加载 GGUF 主模型 + 可选 mmproj 视觉投影器 + 可选 MTP 投机解码头。
     集成 Unsloth Native MTP 投机解码 (--spec-type draft-mtp)、GPU 端采样 (--backend-sampling)、
     超大 MoE 专家权重自动异构卸载 (-ot ".ffn_.*_exps.=CPU") 与 q8_0/q4_0 高带宽 KV Cache。
     """
-    bin_path, env = _ensure_llama_server_binary()
+    bin_path, env = _ensure_llama_server_binary(report_progress=not for_prompt_expansion)
 
     try:
         weights_gb = float(total_weights_gb) if (total_weights_gb and total_weights_gb > 0) else (os.path.getsize(gguf_path) / (1024 ** 3))
@@ -4405,6 +4634,8 @@ def _start_qwen_gguf_server(
     last_err = ""
 
     for attempt_idx, (kv_type, ngl_val, use_mtp, moe_ot) in enumerate(attempts):
+        if cancel_event is not None and cancel_event.is_set():
+            raise GenerationAbortedError("已手动停止当前推理任务")
         port = _pick_free_local_port()
         cmd = [
             bin_path,
@@ -4420,7 +4651,6 @@ def _start_qwen_gguf_server(
             "--cache-type-v", kv_type,
             "-b", "2048",
             "-ub", "1024",
-            "--backend-sampling",
             "--samplers", "top_k;top_p;min_p;temperature",
             "--temp", "1.0",
             "--top-p", "0.95",
@@ -4432,6 +4662,11 @@ def _start_qwen_gguf_server(
             "--reasoning-format", "deepseek",
             "-ngl", str(ngl_val),
         ]
+        if for_prompt_expansion:
+            # Schema-constrained sampling uses the CPU grammar sampler.
+            cmd.extend(["--alias", model_name])
+        else:
+            cmd.append("--backend-sampling")
         if moe_ot:
             cmd.extend(["-ot", ".ffn_.*_exps.=CPU"])
         if use_mtp and mtp_path:
@@ -4446,6 +4681,8 @@ def _start_qwen_gguf_server(
             ])
         if mmproj_path and os.path.exists(mmproj_path):
             cmd.extend(["--mmproj", mmproj_path, "--image-min-tokens", "1024"])
+            if image_max_tokens is not None:
+                cmd.extend(["--image-max-tokens", str(image_max_tokens)])
 
         if moe_ot:
             fit_desc = "MoE 异构驻留 (Attention GPU + Experts CPU)"
@@ -4458,10 +4695,11 @@ def _start_qwen_gguf_server(
             f"[GGUF 引擎] 正在启动 {model_name}{mtp_desc} 服务 "
             f"(上下文 {ctx_len // 1024}K={ctx_len}, KV={kv_type}, GPU采样, {fit_desc}, port={port})..."
         )
-        MODEL_DOWNLOAD_STATE["progress"] = 0.55
-        MODEL_DOWNLOAD_STATE["message"] = (
-            f"正在将 {model_name}{mtp_desc} 装载至 GPU ({ctx_len // 1024}K 上下文 · KV {kv_type} · {fit_desc})..."
-        )
+        if not for_prompt_expansion:
+            MODEL_DOWNLOAD_STATE["progress"] = 0.55
+            MODEL_DOWNLOAD_STATE["message"] = (
+                f"正在将 {model_name}{mtp_desc} 装载至 GPU ({ctx_len // 1024}K 上下文 · KV {kv_type} · {fit_desc})..."
+            )
 
         recent_logs: List[str] = []
         proc = subprocess.Popen(
@@ -4492,6 +4730,9 @@ def _start_qwen_gguf_server(
         deadline = time.time() + 240.0
         ready = False
         while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                _stop_gguf_server_bundle({"backend": "gguf", "server_proc": proc})
+                raise GenerationAbortedError("已手动停止当前推理任务")
             if proc.poll() is not None:
                 break
             try:
@@ -4501,7 +4742,7 @@ def _start_qwen_gguf_server(
                         break
             except urllib.error.HTTPError as he:
                 # 503 表示 llama-server 正在加载权重到显存
-                if he.code == 503:
+                if he.code == 503 and not for_prompt_expansion:
                     MODEL_DOWNLOAD_STATE["progress"] = min(0.95, round(MODEL_DOWNLOAD_STATE["progress"] + 0.01, 2))
             except Exception:
                 pass
@@ -7589,6 +7830,10 @@ class DownloadModelRequest(BaseModel):
     modality: str = "auto"
 
 
+class DownloadImagePERequest(BaseModel):
+    include_projector: bool = False
+
+
 class LoadModelRequest(BaseModel):
     model_id: Optional[str] = None
     precision_mode: str = "bf16"
@@ -7631,11 +7876,13 @@ class GenerateVideoRequest(BaseModel):
     model_id: Optional[str] = None
     task_mode: str = "t2va"
     visual_prompt: str
+    enhance_prompt: bool = False
     negative_prompt: str = ""
     soundscape_prompt: str = ""
     music_prompt: str = ""
     first_frame_base64: Optional[str] = None
     last_frame_base64: Optional[str] = None
+    reference_images_base64: Optional[List[str]] = None
     width: int = 832
     height: int = 480
     num_frames: int = 124
@@ -7665,6 +7912,36 @@ def decode_base64_image(b64_str: Optional[str]) -> Optional[Image.Image]:
         b64_str = b64_str.split(",", 1)[1]
     raw = base64.b64decode(b64_str)
     return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def _edit_reference_sources(req: GenerateVideoRequest, pipeline_arch: str) -> List[str]:
+    sources = req.reference_images_base64
+    if sources is None:
+        sources = [value for value in (req.first_frame_base64, req.last_frame_base64) if value]
+        if pipeline_arch == "z_image_turbo":
+            sources = sources[:1]  # Legacy clients also sent their second frame slot to this single-image pipeline.
+    else:
+        limit = EDIT_REFERENCE_LIMITS.get(pipeline_arch)
+        if req.task_mode != "i2i_edit" or limit is None:
+            raise ValueError("当前模型或任务不支持参考图列表，请选择支持参考图的图像编辑模式。")
+        if len(sources) > limit:
+            raise ValueError(f"已提供 {len(sources)} 张参考图，当前模型最多支持 {limit} 张。")
+    if not sources:
+        raise ValueError("图像编辑需要至少一张参考图。")
+    return sources
+
+
+def _decode_edit_references(req: GenerateVideoRequest, pipeline_arch: str) -> List[Image.Image]:
+    images = []
+    for index, source in enumerate(_edit_reference_sources(req, pipeline_arch), start=1):
+        try:
+            image = decode_base64_image(source)
+            if image is None:
+                raise ValueError("图片为空")
+        except (ValueError, OSError, Image.DecompressionBombError) as exc:
+            raise ValueError(f"无法读取第 {index} 张参考图，请重新选择这张图片。") from exc
+        images.append(image)
+    return images
 
 
 def _split_thinking_and_answer(raw_text: str) -> Tuple[str, str]:
@@ -8136,12 +8413,12 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
             base_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
         JOBS[job_id]["seed"] = base_seed
 
-        first_img = decode_base64_image(req.first_frame_base64)
-        last_img = decode_base64_image(req.last_frame_base64)
-
         keyframes = []
         keyframe_indices = []
+        edit_images = []
         if pipeline_arch == "minimax_h3" and req.task_mode == "fl2va":
+            first_img = decode_base64_image(req.first_frame_base64)
+            last_img = decode_base64_image(req.last_frame_base64)
             if first_img is not None:
                 keyframes.append(first_img)
                 keyframe_indices.append(0)
@@ -8152,15 +8429,14 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                 JOBS[job_id]["status"] = "failed"
                 JOBS[job_id]["message"] = "首尾帧模式下请至少提供首帧或尾帧图片"
                 return
-        elif modality == "image" and req.task_mode == "i2i_edit" and first_img is None and last_img is None:
-            JOBS[job_id]["status"] = "failed"
-            JOBS[job_id]["message"] = "图像编辑/重绘模式下请至少拖入一张输入图片"
-            return
+        elif modality == "image" and req.task_mode == "i2i_edit":
+            edit_images = _decode_edit_references(req, pipeline_arch)
 
         _refresh_drive_mount_state()
         os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
         last_filename = None
         last_seed = base_seed
+        image_prompt = req.visual_prompt
 
         for batch_idx in range(batch_count):
             if job_cancel_event.is_set():
@@ -8204,6 +8480,21 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 touch_activity()
                 _reclaim_transient_gpu_memory()
+
+                if batch_idx == 0 and modality == "image" and req.enhance_prompt:
+                    def set_pe_stage(message: str):
+                        if not job_cancel_event.is_set():
+                            JOBS[job_id]["message"] = message
+
+                    set_pe_stage("正在准备 MiniMax-H3-Image-PE 提示词模板...")
+                    image_prompt = expand_image_prompt(
+                        image_prompt, images=edit_images, width=req.width, height=req.height, seed=current_seed,
+                        cancel_event=job_cancel_event, on_stage=set_pe_stage,
+                    )
+                    if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
+                        raise GenerationAbortedError("已手动停止当前推理任务")
+                    JOBS[job_id]["expanded_prompt"] = image_prompt
+                    JOBS[job_id]["message"] = f"{spec['name']} 正在使用增强后的指令生成图像..."
 
                 with _pipeline_job_execution_guard(
                     pipe=active_pipe,
@@ -8256,11 +8547,10 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                     elif pipeline_arch == "qwen_image_21":
                         filename = f"qwen_image21_{req.task_mode}_{timestamp}_seed{current_seed}.png"
                         output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
-                        edit_imgs = [im for im in (first_img, last_img) if im is not None] if req.task_mode == "i2i_edit" else None
                         img_out = active_pipe(
-                            prompt=req.visual_prompt,
+                            prompt=image_prompt,
                             negative_prompt=req.negative_prompt.strip() or " ",
-                            edit_image=edit_imgs if edit_imgs else None,
+                            edit_image=edit_images or None,
                             height=int(req.height),
                             width=int(req.width),
                             num_inference_steps=int(req.num_inference_steps),
@@ -8273,14 +8563,13 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         JOBS[job_id]["message"] = f"{prefix}正在写入无损 PNG 图像文件 (96%)..."
                         img_out.save(output_path)
                         img_out = None
-                        edit_imgs = None
 
                     elif pipeline_arch == "z_image_turbo":
                         filename = f"z_image_turbo_{req.task_mode}_{timestamp}_seed{current_seed}.png"
                         output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
                         w, h = int(req.width), int(req.height)
                         call_kw = dict(
-                            prompt=req.visual_prompt,
+                            prompt=image_prompt,
                             negative_prompt=req.negative_prompt or "",
                             height=h,
                             width=w,
@@ -8289,8 +8578,8 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                             rand_device="cuda",
                             progress_bar_cmd=step_progress_bar,
                         )
-                        if req.task_mode == "i2i_edit" and first_img is not None:
-                            call_kw["input_image"] = first_img.resize((w, h))
+                        if edit_images:
+                            call_kw["input_image"] = edit_images[0].resize((w, h))
                             call_kw["denoising_strength"] = max(0.15, min(1.0, float(req.denoising_strength or 0.70)))
                         img_out = active_pipe(**call_kw)
                         if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
@@ -8305,7 +8594,6 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         filename = f"minimax_h3_image_{req.task_mode}_{timestamp}_seed{current_seed}.png"
                         output_path = os.path.join(DEFAULT_OUTPUT_DIR, filename)
                         w, h = int(req.width), int(req.height)
-                        ref_imgs = [im for im in (first_img, last_img) if im is not None] if req.task_mode == "i2i_edit" else None
                         JOBS[job_id]["progress"] = round(base_prog + 0.18 * span_prog, 3)
                         JOBS[job_id]["message"] = f"{prefix}正在执行 MiniMax-H3-Image 6 步 PDD 蒸馏原生超清采样 ({w}×{h})..."
                         with CONSOLE_LOCK:
@@ -8314,11 +8602,11 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                             )
                         img_out = run_minimax_h3_image_inference(
                             active_pipe=active_pipe,
-                            prompt=req.visual_prompt,
+                            prompt=image_prompt,
                             width=w,
                             height=h,
                             seed=int(current_seed),
-                            ref_images=ref_imgs,
+                            ref_images=edit_images,
                         )
                         if job_cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
                             raise GenerationAbortedError("已手动停止当前推理任务")
@@ -8326,7 +8614,6 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         JOBS[job_id]["message"] = f"{prefix}正在写入无损 PNG 图像文件 (96%)..."
                         img_out.save(output_path)
                         img_out = None
-                        ref_imgs = None
 
                     elif pipeline_arch == "diffusers_image":
                         filename = f"{active_model_id}_{req.task_mode}_{timestamp}_seed{current_seed}.png"
@@ -8334,7 +8621,7 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
                         w, h = int(req.width), int(req.height)
                         gen = torch.Generator(device="cuda").manual_seed(int(current_seed))
                         out_res = active_pipe(
-                            prompt=req.visual_prompt,
+                            prompt=image_prompt,
                             height=h,
                             width=w,
                             num_inference_steps=int(req.num_inference_steps),
@@ -9602,15 +9889,27 @@ def attach_macos_api_routes(app: FastAPI):
     @app.post("/v1/images/generations")
     @app.post("/images/generations")
     async def openai_images_generations(request: Request):
-        """当显存中驻留了 Qwen-Image-2.1 或 Z-Image-Turbo（可与 Qwen3.8-27B 同时共驻）时，提供标准 OpenAI 生图接口"""
-        global API_REQUEST_COUNT
+        import asyncio
+
         auth_err = _verify_external_api_auth(request, protocol="openai")
         if auth_err:
             return auth_err
         touch_activity()
+        return await asyncio.to_thread(_generate_gateway_images, await request.json())
 
-        body = await request.json()
+    def _generate_gateway_images(body: Dict[str, Any]):
+        global API_REQUEST_COUNT
         req_model_str = str(body.get("model") or "").lower()
+        if req_model_str.replace("_", "-").split("/")[-1] == "minimax-h3-image-pe":
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "Select an image generator as model and pass enhance_prompt=true to use MiniMax-H3-Image-PE.",
+                "type": "invalid_request_error",
+            }})
+        enhance_prompt = body.get("enhance_prompt", False)
+        if not isinstance(enhance_prompt, bool):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "enhance_prompt must be a boolean.", "type": "invalid_request_error",
+            }})
         img_target_id: Optional[str] = None
         if ("minimax" in req_model_str or "h3-image" in req_model_str or "h3_image" in req_model_str) and "minimax_h3_image" in LOADED_RUNTIMES:
             img_target_id = "minimax_h3_image"
@@ -9630,8 +9929,6 @@ def attach_macos_api_routes(app: FastAPI):
                 content={"error": {"message": "请先在客户端加载 MiniMax-H3-Image、Qwen-Image-2.1 或 Z-Image-Turbo 至显存。", "type": "server_error"}},
             )
 
-        img_pipe = LOADED_RUNTIMES[img_target_id]["pipeline"]
-        API_REQUEST_COUNT += 1
         prompt = body.get("prompt", "")
         default_sz = "2048x2048" if img_target_id == "minimax_h3_image" else "1024x1024"
         size_str = str(body.get("size", default_sz)).lower()
@@ -9644,6 +9941,25 @@ def attach_macos_api_routes(app: FastAPI):
 
         results = []
         with GPU_LOCK:
+            img_pipe = LOADED_RUNTIMES.get(img_target_id, {}).get("pipeline")
+            if img_pipe is None:
+                return JSONResponse(status_code=503, content={"error": {
+                    "message": "The selected image generator has been unloaded.", "type": "server_error",
+                }})
+            API_REQUEST_COUNT += 1
+            if enhance_prompt:
+                if not isinstance(prompt, str) or not prompt.strip():
+                    return JSONResponse(status_code=400, content={"error": {
+                        "message": "Prompt enhancement requires a non-empty prompt.", "type": "invalid_request_error",
+                    }})
+                try:
+                    prompt = expand_image_prompt(
+                        prompt, images=[], width=w, height=h, seed=int(torch.randint(0, 2**31 - 1, (1,)).item()),
+                    )
+                except Exception as e:
+                    return JSONResponse(status_code=503, content={"error": {
+                        "message": f"MiniMax-H3-Image-PE: {e}", "type": "server_error",
+                    }})
             for _ in range(n):
                 cur_seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
                 if img_target_id == "minimax_h3_image":
@@ -9660,7 +9976,10 @@ def attach_macos_api_routes(app: FastAPI):
                     img = img_pipe(prompt=prompt, negative_prompt=" ", width=w, height=h, num_inference_steps=steps, seed=cur_seed)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                results.append({"b64_json": base64.b64encode(buf.getvalue()).decode("ascii")})
+                result = {"b64_json": base64.b64encode(buf.getvalue()).decode("ascii")}
+                if enhance_prompt:
+                    result["revised_prompt"] = prompt
+                results.append(result)
         return {"created": int(time.time()), "data": results}
 
     # --------------------------------------------------------------------------
@@ -10005,6 +10324,13 @@ def attach_macos_api_routes(app: FastAPI):
             t.start()
         return get_gpu_status_dict(model_id=target_id)
 
+    @app.post("/minimax_api/image_pe/download")
+    def api_download_image_pe(req: DownloadImagePERequest):
+        touch_activity()
+        if not os.environ.get("EASYCOLAB_IMAGE_PE_BASE_URL", "").strip():
+            _queue_image_pe_weights(req.include_projector)
+        return get_gpu_status_dict()
+
     @app.post("/minimax_api/load_model")
     def api_load_model(req: LoadModelRequest):
         global QWEN_CONTEXT_LENGTH
@@ -10073,6 +10399,12 @@ def attach_macos_api_routes(app: FastAPI):
             else SELECTED_MODEL_ID
         )
         req.model_id = target_model_id
+        if req.reference_images_base64 is not None:
+            # Reject an invalid list before a new request can supersede another generation job.
+            try:
+                _edit_reference_sources(req, MODEL_CATALOG[target_model_id].get("pipeline_arch") or target_model_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not LOADED_RUNTIMES and PIPELINE is None and LLM_BUNDLE is None:
             return {
                 "job_id": "none",

@@ -83,6 +83,7 @@ from windows_app.widgets import (
     AutoHeightStackedWidget,
     CollapsibleBox,
     CombinedTelemetryChartWidget,
+    EditReferenceList,
     FrameDropWell,
     MediaPreviewWidget,
     ModeRadioCard,
@@ -788,6 +789,18 @@ class WorkspaceMixin:
 
     # ─── Studio D: Qwen-Image-2.1 & Z-Image-Turbo Studio ─────────────────────
 
+    def _sync_edit_reference_controls(self, *_args) -> None:
+        count = self.img_ref_list.count()
+        limit = self.vm.max_edit_references
+        self.img_ref_list.limit = limit
+        self.img_add_refs_btn.setEnabled(count < limit)
+        self.img_remove_refs_btn.setEnabled(bool(self.img_ref_list.selectedItems()))
+        if count > limit:
+            label = tr(f"已选 {count} 张，须移除 {count - limit} 张", f"{count} selected, remove {count - limit}")
+        else:
+            label = tr(f"已选 {count} / {limit} 张", f"{count} / {limit} selected")
+        self.img_ref_count.setText(label)
+
     def _build_image_studio(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -797,23 +810,28 @@ class WorkspaceMixin:
         self.img_refs_card = WorkspaceCard(
             tr("指令修图 / 风格重绘参考图", "Instruction Edit / Img2Img Reference Images"),
             tr(
-                "上传原图后输入自然语言修改指令（Qwen-Image-2.1 支持双图主体融合）",
-                "Upload source image(s) and enter natural-language edit instructions (Qwen-Image-2.1 supports dual-image fusion)",
+                "可多选或拖入图片。编辑指令中可按编号引用每张图。开启 PE 后，它会结合这些图片扩写指令。",
+                "Add or drop images, then refer to them by number in your instructions. With PE enabled, it uses these images to expand your edit prompt.",
             ),
         )
-        r_row = QHBoxLayout()
-        r_row.setSpacing(12)
-        self.img_ref1_well = FrameDropWell(
-            tr("主参考图 1 (必选)", "Primary Reference 1 (Required)"),
-            tr("拖拽或点击上传主参考图", "Drop or click to upload primary image"),
-        )
-        self.img_ref2_well = FrameDropWell(
-            tr("融合参考图 2 (可选)", "Fusion Reference 2 (Optional)"),
-            tr("拖拽或点击上传第二张融合参考图", "Drop or click to upload second fusion image"),
-        )
-        r_row.addWidget(self.img_ref1_well, 1)
-        r_row.addWidget(self.img_ref2_well, 1)
-        self.img_refs_card.body.addLayout(r_row)
+        self.img_ref_list = EditReferenceList()
+        self.img_refs_card.body.addWidget(self.img_ref_list)
+        ref_actions = QHBoxLayout()
+        self.img_add_refs_btn = QPushButton(tr("添加参考图", "Add images"))
+        self.img_add_refs_btn.clicked.connect(self.img_ref_list.choose_files)
+        ref_actions.addWidget(self.img_add_refs_btn)
+        self.img_remove_refs_btn = QPushButton(tr("移除选中图片", "Remove selected"))
+        self.img_remove_refs_btn.clicked.connect(self.img_ref_list.remove_selected)
+        ref_actions.addWidget(self.img_remove_refs_btn)
+        ref_actions.addStretch()
+        self.img_ref_count = QLabel()
+        self.img_ref_count.setWordWrap(True)
+        ref_actions.addWidget(self.img_ref_count)
+        self.img_refs_card.body.addLayout(ref_actions)
+        self.img_ref_list.model().rowsInserted.connect(self._sync_edit_reference_controls)
+        self.img_ref_list.model().rowsRemoved.connect(self._sync_edit_reference_controls)
+        self.img_ref_list.itemSelectionChanged.connect(self._sync_edit_reference_controls)
+        self._sync_edit_reference_controls()
         lay.addWidget(self.img_refs_card)
 
         p_card = WorkspaceCard(
@@ -834,6 +852,26 @@ class WorkspaceMixin:
         self.img_visual_edit.setFixedHeight(92)
         self.img_visual_edit.textChanged.connect(self._on_img_visual_edited)
         p_card.body.addWidget(self.img_visual_edit)
+
+        enhance_prompt = QCheckBox(
+            tr("使用 MiniMax-H3-Image-PE 增强提示词", "Enhance prompt with MiniMax-H3-Image-PE")
+        )
+        enhance_prompt.setChecked(self.vm.enhance_image_prompt)
+        enhance_prompt.toggled.connect(lambda checked: setattr(self.vm, "enhance_image_prompt", checked))
+        p_card.body.addWidget(enhance_prompt)
+
+        pe_details = QLabel(tr(
+            "在 Colab 运行 PE 时，首次下载约 17 GB 的权重，首次修图另需约 931 MB。"
+            "每批生成时自动加载 PE，扩写后释放显存。配置远程 PE 后，由远程服务加载权重。",
+            "When PE runs on Colab, it downloads about 17 GB on first use and another 931 MB for the first edit. "
+            "It loads PE for each batch and frees its GPU memory after expansion. "
+            "If you use a remote PE service, that service loads the weights.",
+        ))
+        pe_details.setWordWrap(True)
+        pe_details.setStyleSheet("font-size: 11.5px; color: #64748B;")
+        pe_details.setVisible(enhance_prompt.isChecked())
+        enhance_prompt.toggled.connect(pe_details.setVisible)
+        p_card.body.addWidget(pe_details)
 
         p_card.body.addWidget(
             QLabel(

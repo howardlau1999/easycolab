@@ -64,6 +64,9 @@ class StudioViewModel: ObservableObject {
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
         didSet {
             if Self.normalizeServerURL(oldValue) != Self.normalizeServerURL(colabServerURL) {
+                serverEditReferenceLimit = nil
+                imagePEStatus = nil
+                submittingImagePEDownload = false
                 adminPassword = Self.savedAdminPassword(for: colabServerURL)
                 remoteApiKeySynced = false
                 remoteIdleSynced = false
@@ -147,7 +150,14 @@ class StudioViewModel: ObservableObject {
 
     // 远端 GPU 与多模型驻留状态
     @Published var isConnected: Bool = false {
-        didSet { syncMacOSRuntimeActivityAssertion() }
+        didSet {
+            if !isConnected {
+                serverEditReferenceLimit = nil
+                imagePEStatus = nil
+                submittingImagePEDownload = false
+            }
+            syncMacOSRuntimeActivityAssertion()
+        }
     }
     @Published var gpuName: String = L(StudioViewModel.defaultGpuNameZh, StudioViewModel.defaultGpuNameEn) {
         didSet { let c = stripEmoji(gpuName); if c != gpuName { gpuName = c } }
@@ -267,11 +277,17 @@ class StudioViewModel: ObservableObject {
     // 任务模式与生成参数
     @Published var taskModeId: String = "t2va"
     @Published var visualPrompt: String = PRESET_TEMPLATES[0].visual
+    @Published var enhanceImagePrompt = false
+    @Published var imagePEStatus: ImagePEStatus?
+    @Published var submittingImagePEDownload = false
     @Published var negativePrompt: String = ""
     @Published var soundscapePrompt: String = PRESET_TEMPLATES[0].soundscape
     @Published var musicPrompt: String = PRESET_TEMPLATES[0].music
     @Published var firstFrameImage: NSImage? = nil
     @Published var lastFrameImage: NSImage? = nil
+    @Published var editReferenceImages: [NSImage] = []
+    @Published var importingEditReferences = false
+    @Published var serverEditReferenceLimit: Int?
     @Published var selectedVideoResolution: ResolutionOption = VIDEO_RESOLUTIONS[0]
     @Published var selectedImageResolution: ResolutionOption = IMAGE_RESOLUTIONS[0]
     @Published var numFrames: Double = 124
@@ -681,6 +697,22 @@ class StudioViewModel: ObservableObject {
         selectedModelId == "minimax_h3_image" || activeModelSpec.repoId.lowercased() == "minimaxai/minimax-h3-image"
     }
 
+    var modelEditReferenceLimit: Int {
+        if isMiniMaxH3ImageModel { return 16 }
+        if selectedModelId == "qwen_image_21" { return 10 }
+        if selectedModelId == "z_image_turbo" { return 1 }
+        return 2
+    }
+
+    var editReferenceLimit: Int {
+        if let limit = serverEditReferenceLimit { return limit }
+        return isConnected ? min(modelEditReferenceLimit, 2) : modelEditReferenceLimit
+    }
+
+    var waitingForEditReferences: Bool {
+        taskModeId == "i2i_edit" && importingEditReferences
+    }
+
     var activeImageResolutions: [ResolutionOption] {
         isMiniMaxH3ImageModel ? MINIMAX_H3_IMAGE_RESOLUTIONS : IMAGE_RESOLUTIONS
     }
@@ -745,6 +777,7 @@ class StudioViewModel: ObservableObject {
     func switchSelectedModel(_ spec: OpenModelSpec) {
         guard selectedModelId != spec.id else { return }
         selectedModelId = spec.id
+        serverEditReferenceLimit = nil
         taskModeId = spec.modes[0].id
         inferenceSteps = spec.defaultSteps
         selectedPrecision = "bf16"
@@ -903,6 +936,7 @@ class StudioViewModel: ObservableObject {
             var req = try adminRequest(url)
             req.timeoutInterval = isGenerating ? 28 : (silent ? 20 : 22)
             let (data, resp) = try await adminSession.data(for: req)
+            guard base == normalizedBaseURL else { return }
             let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
 
             if statusCode == 404 {
@@ -936,6 +970,7 @@ class StudioViewModel: ObservableObject {
 
             consecutiveStatusFailures = 0
             let decoded = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            imagePEStatus = decoded.image_pe
             applyStatusResponse(decoded)
 
             if !silent {
@@ -957,6 +992,7 @@ class StudioViewModel: ObservableObject {
                 }
             }
         } catch {
+            guard base == normalizedBaseURL else { return }
             consecutiveStatusFailures += 1
             let failureLimit = isGenerating ? 8 : 5
             if !silent {
@@ -993,6 +1029,37 @@ class StudioViewModel: ObservableObject {
             }
             applyStatusResponse(decoded)
         } catch {}
+    }
+
+    func downloadImagePEWeights() async {
+        let base = normalizedBaseURL
+        guard isConnected, let pe = imagePEStatus, pe.mode == "local",
+              !pe.downloading, !submittingImagePEDownload,
+              let url = URL(string: "\(base)/minimax_api/image_pe/download") else { return }
+        submittingImagePEDownload = true
+        defer { if base == normalizedBaseURL { submittingImagePEDownload = false } }
+        do {
+            var request = try adminRequest(url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["include_projector": taskModeId == "i2i_edit"])
+            let (data, response) = try await adminSession.data(for: request)
+            guard base == normalizedBaseURL, isConnected else { return }
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200..<300).contains(code) else {
+                if code == 404 { imagePEStatus = nil }
+                statusMessage = L("Colab 未接受 PE 下载请求（HTTP \(code)）。", "Colab rejected the PE download request (HTTP \(code)).")
+                return
+            }
+            let status = try JSONDecoder().decode(ColabStatusResponse.self, from: data)
+            imagePEStatus = status.image_pe
+            if status.action_ok == false, let message = status.action_message {
+                statusMessage = localizeServerText(message)
+            }
+        } catch {
+            guard base == normalizedBaseURL, isConnected else { return }
+            statusMessage = L("提交 PE 下载失败：\(error.localizedDescription)", "Could not start the PE download: \(error.localizedDescription)")
+        }
     }
 
     func startRemoteDownloadWeights() async {
@@ -1247,14 +1314,6 @@ class StudioViewModel: ObservableObject {
             )
             return
         }
-        if taskModeId == "i2i_edit" && firstFrameImage == nil && lastFrameImage == nil {
-            statusMessage = L(
-                "在「图像编辑/重绘」模式下，请至少拖入一张参考原图。",
-                "In Image Edit / Restyle mode, please drop at least one reference image."
-            )
-            return
-        }
-
         await checkColabStatus(silent: true)
         guard isConnected else {
             statusMessage = L(
@@ -1276,6 +1335,21 @@ class StudioViewModel: ObservableObject {
                 )
             }
             return
+        }
+        if taskModeId == "i2i_edit" {
+            guard !importingEditReferences else {
+                statusMessage = L("正在读取参考图，请稍候再生成。", "Wait for the references to finish loading before generating.")
+                return
+            }
+            guard !editReferenceImages.isEmpty else {
+                statusMessage = L("请添加至少一张修图参考图。", "Add at least one reference image for editing.")
+                return
+            }
+            guard editReferenceImages.count <= editReferenceLimit else {
+                statusMessage = L("当前模型和服务端最多接受 \(editReferenceLimit) 张参考图，请先移除多出的图片。",
+                                  "This model and server accept up to \(editReferenceLimit) references. Remove the extra images first.")
+                return
+            }
         }
 
         let base = normalizedBaseURL
@@ -1343,12 +1417,29 @@ class StudioViewModel: ObservableObject {
                 "repeat_penalty": 1.0,
                 "reasoning_effort": reasoningEffort
             ]
+            if activeModelSpec.modality == .image && enhanceImagePrompt {
+                payload["enhance_prompt"] = true
+            }
             if !chatPayload.isEmpty {
                 payload["chat_messages"] = chatPayload
             }
 
-            let needsImage = ["fl2va", "i2v", "i2i_edit", "vlm"].contains(taskModeId)
-            if needsImage {
+            if taskModeId == "i2i_edit" {
+                let references = try editReferenceImages.enumerated().map { index, image in
+                    guard let encoded = autoreleasepool(invoking: { encodeImageToBase64(image) }) else {
+                        let message = L("无法读取参考图 \(index + 1)，请替换该图后重试。",
+                                        "Could not encode reference \(index + 1). Replace it and try again.")
+                        throw NSError(domain: "EasyColab", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+                    }
+                    return encoded
+                }
+                if serverEditReferenceLimit != nil {
+                    payload["reference_images_base64"] = references
+                } else {
+                    payload["first_frame_base64"] = references.first
+                    if references.count == 2 { payload["last_frame_base64"] = references[1] }
+                }
+            } else if ["fl2va", "i2v", "vlm"].contains(taskModeId) {
                 if let firstImg = firstFrameImage, let b64 = encodeImageToBase64(firstImg) {
                     payload["first_frame_base64"] = b64
                 }

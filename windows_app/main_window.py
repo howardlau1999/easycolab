@@ -180,9 +180,8 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             "video_last_well": getattr(self.video_last_well, "_file_path", None),
             "vlm_img1_well": getattr(self.vlm_img1_well, "_file_path", None),
             "vlm_img2_well": getattr(self.vlm_img2_well, "_file_path", None),
-            "img_ref1_well": getattr(self.img_ref1_well, "_file_path", None),
-            "img_ref2_well": getattr(self.img_ref2_well, "_file_path", None),
         }
+        edit_refs = [self.img_ref_list.takeItem(0) for _ in range(self.img_ref_list.count())]
         show_log = self._show_right_log
         oauth_txt = self.oauth_input.text()
         hf_tok_txt = self.hf_token_input.text()
@@ -255,6 +254,8 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         for attr_name, fpath in well_paths.items():
             if fpath is not None and Path(fpath).exists():
                 getattr(self, attr_name).load_from_file(Path(fpath))
+        for item in edit_refs:
+            self.img_ref_list.addItem(item)
 
         self._apply_theme()
         self._refresh_all_state()
@@ -280,8 +281,6 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
             self.video_last_well,
             self.vlm_img1_well,
             self.vlm_img2_well,
-            self.img_ref1_well,
-            self.img_ref2_well,
         ):
             well.set_palette_theme(pal)
         self.media_preview.set_palette_theme(pal)
@@ -1282,6 +1281,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
 
         first_b64: Optional[str] = None
         last_b64: Optional[str] = None
+        edit_refs = None
         if spec.modality in (ModelModality.VIDEO_AUDIO, ModelModality.VIDEO):
             self.vm.visual_prompt = self.vid_visual_edit.toPlainText()
             if self.vm.task_mode_id == "fl2va":
@@ -1295,11 +1295,14 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         elif spec.modality == ModelModality.IMAGE:
             self.vm.visual_prompt = self.img_visual_edit.toPlainText()
             if self.vm.task_mode_id == "i2i_edit":
-                first_b64 = self.img_ref1_well.to_jpeg_base64()
-                if spec.id == "qwen_image_21":
-                    last_b64 = self.img_ref2_well.to_jpeg_base64()
+                edit_refs = [
+                    self.img_ref_list.item(i).data(Qt.ItemDataRole.UserRole)
+                    for i in range(self.img_ref_list.count())
+                ]
 
-        self.vm.start_generation(first_frame_b64=first_b64, last_frame_b64=last_b64)
+        self.vm.start_generation(
+            first_frame_b64=first_b64, last_frame_b64=last_b64, reference_images_b64=edit_refs,
+        )
         if spec.modality == ModelModality.LLM_VLM and not self.vm.visual_prompt:
             self._syncing_ui = True
             self.llm_prompt_edit.clear()
@@ -1679,7 +1682,7 @@ class EasyColabMainWindow(WorkspaceMixin, QMainWindow):
         elif spec.modality == ModelModality.IMAGE:
             self.studio_stack.setCurrentIndex(3)
             self.img_refs_card.setVisible(self.vm.task_mode_id == "i2i_edit")
-            self.img_ref2_well.setVisible(spec.id == "qwen_image_21")
+            self._sync_edit_reference_controls()
             self.shared_media_split.setVisible(True)
             self.right_gallery_stack.setCurrentIndex(0)
             self._update_gen_bar(

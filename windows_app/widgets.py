@@ -12,13 +12,14 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
-from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRectF, Qt, QUrl, Signal
+from PySide6.QtCore import QBuffer, QIODevice, QPointF, QRectF, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
     QImage,
+    QIcon,
     QLinearGradient,
     QMouseEvent,
     QPainter,
@@ -31,6 +32,9 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -624,6 +628,81 @@ class CombinedTelemetryChartWidget(QWidget):
 # ─── Drag-and-Drop Image Frame Well ──────────────────────────────────────────
 
 
+def image_as_jpeg_base64(image: QImage, quality: int = 92) -> str:
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not image.convertToFormat(QImage.Format.Format_RGB888).save(buf, "JPG", quality):
+        return ""
+    return base64.b64encode(bytes(buf.data())).decode("ascii")
+
+
+class EditReferenceList(QListWidget):
+    """Numbered edit references in the order sent to the image model."""
+
+    def __init__(self):
+        super().__init__()
+        self.limit = 1
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
+        self.setIconSize(QSize(54, 42))
+        self.setFixedHeight(146)
+
+    def choose_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, tr("添加修图参考图", "Add edit references"), "",
+            tr("图像文件 (*.png *.jpg *.jpeg *.webp *.bmp)", "Image files (*.png *.jpg *.jpeg *.webp *.bmp)"),
+        )
+        self.add_files(files)
+
+    def add_files(self, files: List[str]) -> None:
+        if not files:
+            return
+        if self.count() + len(files) > self.limit:
+            QMessageBox.warning(self, tr("参考图数量", "Reference count"), tr(
+                f"当前最多可用 {self.limit} 张参考图。已选 {self.count()} 张，本次添加 {len(files)} 张。",
+                f"Limit: {self.limit} references. Already selected: {self.count()}. Adding: {len(files)}.",
+            ))
+            return
+        items = []
+        for path in files:
+            image = QImage(path)
+            encoded = image_as_jpeg_base64(image) if not image.isNull() else ""
+            if not encoded:
+                QMessageBox.warning(self, tr("读取图片失败", "Cannot read image"), path)
+                return
+            thumb = image.scaled(self.iconSize(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            item = QListWidgetItem(QIcon(QPixmap.fromImage(thumb)), "")
+            item.setToolTip(path)
+            item.setData(Qt.ItemDataRole.UserRole, encoded)
+            items.append(item)
+        for item in items:
+            self.addItem(item)
+        self.renumber()
+
+    def renumber(self) -> None:
+        for index in range(self.count()):
+            item = self.item(index)
+            item.setText(f"{index + 1}. {Path(item.toolTip()).name}")
+
+    def remove_selected(self) -> None:
+        for item in self.selectedItems():
+            self.takeItem(self.row(item))
+        self.renumber()
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        self.add_files([url.toLocalFile() for url in event.mimeData().urls()])
+        event.acceptProposedAction()
+
+
 class FrameDropWell(QFrame):
     """Drag-and-drop or click-to-select image input well with JPEG 0.92 raw base64 output."""
 
@@ -698,13 +777,7 @@ class FrameDropWell(QFrame):
         if not self.has_image():
             return None
         assert self._image is not None
-        rgb_img = self._image.convertToFormat(QImage.Format.Format_RGB888)
-        buf = QBuffer()
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        rgb_img.save(buf, "JPG", quality)
-        raw = bytes(buf.data())
-        buf.close()
-        return base64.b64encode(raw).decode("ascii")
+        return image_as_jpeg_base64(self._image, quality)
 
     def _refresh_thumbnail(self) -> None:
         if not self.has_image():

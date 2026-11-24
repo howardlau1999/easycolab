@@ -593,8 +593,8 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
                 id: "i2i_edit",
                 titleZh: "多图指令修图",
                 titleEn: "Multi-Image Edit",
-                subtitleZh: "从相册选 1~2 张原图，用自然语言改局部、换背景或融合主体",
-                subtitleEn: "Pick 1–2 source photos to edit regions or fuse subjects via natural language",
+                subtitleZh: "从相册选取多张原图，用自然语言改局部、换背景或融合主体",
+                subtitleEn: "Pick reference photos to edit regions or fuse subjects via natural language",
                 icon: "wand.and.rays"
             )
         ],
@@ -898,6 +898,7 @@ struct ColabStatusResponse: Codable {
     var model_loaded: Bool?
     var any_model_loaded: Bool?
     var selected_model_id: String?
+    var edit_reference_limit: Int?
     var loaded_model_id: String?
     var loaded_model_ids: [String]?
     var loaded_models_detail: [LoadedModelSummary]?

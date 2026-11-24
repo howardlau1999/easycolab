@@ -1146,29 +1146,23 @@ extension MainStudioView {
             }
         case "i2i_edit":
             WorkspaceCard(
-                title: (vm.selectedModelId == "qwen_image_21" || vm.isMiniMaxH3ImageModel)
-                    ? L("指令修图参考原图", "Instruction Image-Editing References")
-                    : L("图生图重绘参考底图", "Image-to-Image Reference"),
-                subtitle: vm.isMiniMaxH3ImageModel
-                    ? L("支持上传 1~2 张参考图（可在提示词中用 <Picture 1> / <Picture 2> 指代）进行精准修图或融合", "Upload 1–2 reference images (refer via <Picture 1> / <Picture 2> in prompt) for editing or fusion")
-                    : (vm.selectedModelId == "qwen_image_21"
-                        ? L("支持上传 1~2 张参考图进行局部编辑、换背景或多主体融合", "Upload 1–2 reference images for local edits, background swaps, or multi-subject fusion")
-                        : L("上传参考原图并在左侧调节重绘幅度", "Upload a reference image and tune Denoising Strength in the left sidebar")),
+                title: L("修图参考图", "Edit References"),
+                subtitle: L("已选 \(vm.editReferenceImages.count) 张，最多 \(vm.editReferenceLimit) 张。可在指令中按图号指代。",
+                            "\(vm.editReferenceImages.count) selected, up to \(vm.editReferenceLimit). Refer to images by number in the prompt."),
                 icon: "wand.and.rays"
             ) {
-                HStack(spacing: 12) {
-                    FrameDropWell(
-                        title: L("主参考图 1 (必选)", "Primary Reference 1 (Required)"),
-                        subtitle: L("拖入待编辑原图", "Drop source image to edit"),
-                        image: $vm.firstFrameImage
-                    )
-                    if vm.selectedModelId == "qwen_image_21" || vm.isMiniMaxH3ImageModel {
-                        FrameDropWell(
-                            title: L("融合参考图 2 (可选)", "Fusion Reference 2 (Optional)"),
-                            subtitle: L("用于多图主体融合编辑", "For multi-image subject fusion"),
-                            image: $vm.lastFrameImage
-                        )
-                    }
+                EditReferencePicker(images: $vm.editReferenceImages, importing: $vm.importingEditReferences, limit: vm.editReferenceLimit)
+                if vm.isConnected && vm.serverEditReferenceLimit == nil && vm.modelEditReferenceLimit > 2 {
+                    Text(L("重新部署新版 Colab 服务端即可添加更多参考图。",
+                           "Redeploy the updated Colab server to use more references."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if vm.enhanceImagePrompt {
+                    Text(L("PE 会依次读取这些图片，并结合编辑指令扩写提示词。",
+                           "PE reads these images in order and expands the prompt using your editing instruction."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         case "vlm":
@@ -1239,6 +1233,14 @@ extension MainStudioView {
                 palette: palette
             )
 
+            if mod == .image {
+                Toggle(L("使用 MiniMax-H3-Image-PE 增强提示词", "Expand prompt with MiniMax-H3-Image-PE"), isOn: $vm.enhanceImagePrompt)
+                    .font(.caption)
+                if vm.enhanceImagePrompt {
+                    imagePEPreparation
+                }
+            }
+
             if mod == .videoAudio {
                 HStack(alignment: .top, spacing: 12) {
                     promptEditor(
@@ -1282,6 +1284,54 @@ extension MainStudioView {
                 )
             }
         }
+    }
+
+    @ViewBuilder
+    private var imagePEPreparation: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if !vm.isConnected {
+                Text(L("连接 Colab 后可查看和预下载 PE 权重（约 17 GB）。", "Connect to Colab to check or download the PE weights (about 17 GB)."))
+            } else if let pe = vm.imagePEStatus {
+                if pe.mode == "remote" {
+                    Label(L("已配置远程 PE 服务，生成时会将提示词和修图参考图发送给该服务。", "Prompts and edit references will be sent to the configured PE service."), systemImage: "network")
+                } else {
+                    let editing = vm.taskModeId == "i2i_edit"
+                    imagePEFile(L("PE 权重（约 17 GB）", "PE weights (about 17 GB)"), cached: pe.weights_cached)
+                    if editing {
+                        imagePEFile(L("修图视觉投影器（约 931 MB）", "Edit vision projector (about 931 MB)"), cached: pe.projector_cached)
+                    }
+                    if pe.downloading || vm.submittingImagePEDownload {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text(pe.downloading
+                                 ? L("正在下载到 Colab…", "Downloading to Colab…")
+                                 : L("正在提交下载请求…", "Requesting the download…"))
+                        }
+                    } else if !pe.weights_cached || (editing && !pe.projector_cached) {
+                        Button {
+                            Task { await vm.downloadImagePEWeights() }
+                        } label: {
+                            Label(L("下载所需 PE 文件", "Download required PE files"), systemImage: "arrow.down.circle")
+                        }
+                        .controlSize(.small)
+                    }
+                    if let error = pe.error, !error.isEmpty {
+                        Text(L("PE 下载失败：", "PE download failed: ") + localizeServerText(error)).foregroundStyle(.red)
+                    }
+                    Text(L("生成时会自动下载缺少的文件并加载 PE。提示词增强完成后释放 PE 显存，再开始生图。",
+                           "Generation downloads any missing files and loads PE. After expanding the prompt, Colab releases PE from GPU memory and starts generating images."))
+                }
+            } else {
+                Text(L("当前服务未提供 PE 权重状态。重新部署新版服务端后即可在这里预下载。", "This server does not report PE weight status. Redeploy the updated server to download the weights here."))
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func imagePEFile(_ name: String, cached: Bool) -> some View {
+        Label(name + " · " + (cached ? L("已缓存", "Cached") : L("待下载", "Download needed")),
+              systemImage: cached ? "checkmark.circle" : "arrow.down.circle")
     }
 
     func promptEditor(
@@ -1337,6 +1387,9 @@ extension MainStudioView {
                 : L("正在云端 GPU 生成\(liveTime)...",
                     "Generating on Cloud GPU\(liveTime)...")
         }
+        if vm.waitingForEditReferences {
+            return L("正在读取参考图，请稍候…", "Loading reference images…")
+        }
         if !vm.isSelectedModelLoadedInVRAM {
             return L(
                 "开始运行（请先在左侧将 \(vm.activeModelSpec.name) 加载到显存）",
@@ -1381,7 +1434,7 @@ extension MainStudioView {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(vm.isGenerating)
+                .disabled(vm.isGenerating || vm.waitingForEditReferences)
                 .keyboardShortcut(.return, modifiers: [.command])
 
                 if vm.isGenerating {

@@ -347,6 +347,7 @@ def _load_minimax_h3_image_helpers(tmp_root: str):
         "MINIMAX_H3_BF16_FILES",
         "MODEL_CATALOG",
         "MINIMAX_H3_IMAGE_FILES",
+        "MINIMAX_IMAGE_PE_REPO",
         "BUILTIN_MODEL_IDS",
         "MINIMAX_H3_IMAGE_CONFIG_PATTERNS",
         "MINIMAX_H3_IMAGE_REQUIRED_CONFIG_MARKERS",
@@ -429,6 +430,9 @@ class MiniMaxH3ImageEngineTest(unittest.TestCase):
             self.assertEqual(resolved_img["modality"], "image")
             self.assertEqual(resolved_img["pipeline_arch"], "minimax_h3_image")
             self.assertEqual(len(resolved_img["files"]), 27)
+
+            with self.assertRaisesRegex(ValueError, "指令增强"):
+                ns["inspect_and_resolve_hf_repo"]("https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE")
 
             resolved_vid = ns["inspect_and_resolve_hf_repo"]("https://huggingface.co/MiniMaxAI/MiniMax-H3")
             self.assertEqual(resolved_vid["modality"], "video_audio")

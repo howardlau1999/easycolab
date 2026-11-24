@@ -39,6 +39,20 @@ Headless Drive mounting can still copy a Google refresh token with Colab and Clo
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K Poster Generation & Multi-Image Instruction Editing**
      - High-fidelity bilingual typography rendering, natural-language multi-image editing, and 8-step ultra-fast photorealistic generation. All generated MP4 videos and PNG images are automatically pulled back to your local machine (macOS: `~/Movies/EasyColab`, Windows: `%USERPROFILE%\Videos\EasyColab`, Linux: `~/Videos/EasyColab`).
 
+### Image prompt expansion
+
+Load an image generator and enable MiniMax-H3-Image-PE beside the prompt. It expands text-to-image prompts and uses the supplied reference images for editing instructions. Each batch uses one expanded prompt and keeps the selected output dimensions. Expansion is off by default.
+
+MiniMax-H3-Image accepts up to 16 edit references, Qwen-Image-2.1 accepts 10, and Z-Image-Turbo accepts one. With expansion enabled, PE reads every image in the displayed order and uses the edit instructions and target aspect ratio to write the prompt. The generator then receives that prompt and the same reference images. For MiniMax, try “Keep the person from `<Picture 1>`, dress them in the coat from `<Picture 2>`, and use the background from `<Picture 3>`.” [MiniMax model card](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) · [Qwen model card](https://huggingface.co/Qwen/Qwen-Image-2.1)
+
+Enabling expansion on the Mac shows which PE weights Colab has cached. Text-to-image needs about 17 GB for the main model. Reference-image editing also needs a 931 MB vision projector. Download the files ahead of time, or start generating to fetch the missing files automatically.
+
+When generation starts, Colab loads PE into GPU memory, expands the prompt and releases PE before the selected image generator starts sampling. Later runs reuse the downloaded weights. [MiniMax model and prompts](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) · [GGUF conversion](https://huggingface.co/prithivMLmods/MiniMax-H3-Image-PE-NVFP4-GGUF)
+
+To use an existing SGLang deployment of the original checkpoint, set `EASYCOLAB_IMAGE_PE_BASE_URL` (for example, `http://127.0.0.1:30000/v1`) before starting the EasyColab server. Use the served model name `MiniMax-H3-Image-PE`. EasyColab downloads the official prompt templates and request parameters and sends prompts and edit references to that service.
+
+For `POST /v1/images/generations`, set the boolean field `"enhance_prompt": true` and specify the image generator in `model`. Each image in the response includes the prompt used for generation in `revised_prompt`.
+
 ---
 
 ## Quick Start
