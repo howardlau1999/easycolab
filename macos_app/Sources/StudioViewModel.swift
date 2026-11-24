@@ -125,6 +125,7 @@ class StudioViewModel: ObservableObject {
     @Published var accountEmail: String = ""
     @Published var showOAuthCodeInput: Bool = false
     @Published var oauthCodeText: String = ""
+    @Published var isPreparingOAuth: Bool = false
     @Published var officialCUBalance: Double? = nil
 
     var displayAccountLabel: String {
@@ -1790,7 +1791,7 @@ class StudioViewModel: ObservableObject {
         }
 
         if cliLoggedIn {
-            let out = await runBridgeCommand(["stop_all"])
+            let out = await runBridgeCommand(["stop_all"], surfaceErrors: true)
             if let data = out.data(using: .utf8),
                let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) {
                 officialCUBalance = decoded.paid_balance ?? officialCUBalance

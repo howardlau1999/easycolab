@@ -419,8 +419,21 @@ struct MainStudioView: View {
                 .fixedSize()
                 .help(L("切换其他 Google 账号或退出当前绑定", "Switch to another Google account or sign out"))
             } else {
-                Button(L("绑定", "Bind")) { Task { await vm.startGoogleOAuthLogin() } }
-                    .controlSize(.small)
+                Button {
+                    Task { await vm.startGoogleOAuthLogin() }
+                } label: {
+                    if vm.isPreparingOAuth {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text(L("准备中…", "Preparing…"))
+                        }
+                    } else {
+                        Text(L("绑定", "Bind"))
+                    }
+                }
+                .controlSize(.small)
+                .disabled(vm.isPreparingOAuth)
             }
         }
 

@@ -146,7 +146,7 @@ class ViewModelServicesMixin:
                     "pip",
                     "install",
                     "-q",
-                    "google-colab-cli>=0.7.5",
+                    "google-colab-cli==0.7.5",
                     "google-auth>=2.28.0",
                     "google-auth-oauthlib>=1.2.0",
                     "requests>=2.31.0",

@@ -6,6 +6,11 @@ import ObjectiveC.runtime
 
 // MARK: - StudioViewModel 扩展：Google OAuth 桥接、自定义 HF 模型热榜与详情、ComfyUI 与网关同步
 
+final class BridgeCommandOutcome: @unchecked Sendable {
+    var payload: String = ""
+    var failureDetail: String = ""
+}
+
 final class KeepalivePipeLineBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var pending = Data()
@@ -154,30 +159,68 @@ extension StudioViewModel {
         return trimmed
     }
 
-    func runBridgeCommand(_ args: [String], installIfMissing: Bool = false) async -> String {
+    func runBridgeCommand(
+        _ args: [String],
+        installIfMissing: Bool = false,
+        surfaceErrors: Bool = false
+    ) async -> String {
         guard let pyBin = await ensureBridgePythonBin(installIfMissing: installIfMissing) else {
             return ""
         }
         let script = self.bridgeScript
-        return await withCheckedContinuation { continuation in
+        let outcome = BridgeCommandOutcome()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
                 proc.arguments = [script] + args
                 let outPipe = Pipe()
+                let errPipe = Pipe()
                 proc.standardOutput = outPipe
-                proc.standardError = FileHandle.nullDevice
+                proc.standardError = errPipe
                 do {
                     try proc.run()
                     let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                     proc.waitUntilExit()
                     let out = String(data: data, encoding: .utf8) ?? ""
-                    continuation.resume(returning: Self.extractJSONPayload(from: out))
+                    let errOut = String(data: errData, encoding: .utf8) ?? ""
+                    outcome.payload = Self.extractJSONPayload(from: out)
+                    if outcome.payload.isEmpty {
+                        outcome.failureDetail = Self.bridgeFailureSummary(stdout: out, stderr: errOut)
+                    }
                 } catch {
-                    continuation.resume(returning: "")
+                    outcome.failureDetail = error.localizedDescription
                 }
+                continuation.resume()
             }
         }
+        if outcome.payload.isEmpty, surfaceErrors {
+            let command = args.first ?? "bridge"
+            if outcome.failureDetail.isEmpty {
+                statusMessage = L(
+                    "本地 Colab 连接组件未返回结果（\(command)），请稍后重试。",
+                    "The local Colab bridge returned no result (\(command)). Please try again."
+                )
+                liveConsoleLines.append("[colab_bridge] \(command): no output")
+            } else {
+                statusMessage = L(
+                    "本地 Colab 连接组件执行失败：\(outcome.failureDetail)",
+                    "The local Colab bridge failed: \(outcome.failureDetail)"
+                )
+                liveConsoleLines.append("[colab_bridge] \(command) failed: \(outcome.failureDetail)")
+            }
+        }
+        return outcome.payload
+    }
+
+    nonisolated static func bridgeFailureSummary(stdout: String, stderr: String) -> String {
+        let lines = (stderr + "\n" + stdout)
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("Traceback (most recent call last)") && !$0.hasPrefix("^") }
+        guard !lines.isEmpty else { return "" }
+        return String(lines.suffix(3).joined(separator: " | ").prefix(300))
     }
 
     func refreshOfficialColabAccountUsage() async {
@@ -209,13 +252,18 @@ extension StudioViewModel {
     }
 
     func startGoogleOAuthLogin(switchingAccount: Bool = false) async {
-        let out = await runBridgeCommand(["auth_url"], installIfMissing: true)
+        if isPreparingOAuth { return }
+        isPreparingOAuth = true
+        defer { isPreparingOAuth = false }
+        let previousStatus = statusMessage
+        statusMessage = L("正在准备 Google 授权链接…", "Preparing the Google authorization link…")
+        let out = await runBridgeCommand(["auth_url"], installIfMissing: true, surfaceErrors: true)
         guard let data = out.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let authURLStr = json["auth_url"] as? String,
               let url = URL(string: authURLStr) else {
-            if !statusMessage.contains("初始化") && !statusMessage.contains("Initializ") && !statusMessage.contains("Python") {
-                statusMessage = L("获取 Google 授权链接失败", "Failed to obtain Google OAuth authorization URL")
+            if statusMessage == previousStatus || statusMessage.hasPrefix("正在准备 Google") || statusMessage.hasPrefix("Preparing the Google") {
+                statusMessage = L("获取 Google 授权链接失败，请稍后重试。", "Failed to obtain the Google OAuth authorization URL. Please try again.")
             }
             return
         }
@@ -251,7 +299,7 @@ extension StudioViewModel {
         let prevEmail = accountEmail
         let wasLoggedIn = cliLoggedIn
         statusMessage = L("正在验证授权码并同步账户余额...", "Verifying authorization code & syncing CU balance...")
-        let out = await runBridgeCommand(["auth_code", code], installIfMissing: true)
+        let out = await runBridgeCommand(["auth_code", code], installIfMissing: true, surfaceErrors: true)
         guard let data = out.data(using: .utf8),
               let decoded = try? JSONDecoder().decode(BridgeAuthStatusResponse.self, from: data) else {
             statusMessage = L("授权验证失败，请重试。", "Authorization verification failed. Please try again.")

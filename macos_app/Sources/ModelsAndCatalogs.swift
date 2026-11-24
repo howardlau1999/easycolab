@@ -1222,7 +1222,9 @@ enum LocalRuntimePaths {
         for py in candidates where fm.isExecutableFile(atPath: py) {
             let check = Process()
             check.executableURL = URL(fileURLWithPath: py)
-            check.arguments = ["-c", "import colab_cli, google.auth, websocket"]
+            // 必须验证 colab_bridge.py 实际依赖的 colab_cli 内部 API；
+            // 0.7.6+ 移除了 TOKEN_CONFIG_PATH，仅有 import colab_cli 成功并不代表桥接可用。
+            check.arguments = ["-c", "from colab_cli.auth import TOKEN_CONFIG_PATH; from colab_cli.common import state; import google.auth, websocket"]
             check.standardOutput = Pipe()
             check.standardError = Pipe()
             if (try? check.run()) != nil {
